@@ -1,0 +1,36 @@
+name: Minerar repositórios TS+React+Jest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */12 * * *' # a cada 12 horas
+
+concurrency:
+  group: ts-react-jest-miner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Rodar mineração
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/mine_ts_react_jest.js
+
+      - name: Upload do CSV como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repos-ts-react-jest
+          path: output/repos_ts_react_jest.csv
