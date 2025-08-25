@@ -33,7 +33,8 @@ jobs:
           EXCLUDE_COURSE_BOILERPLATE: 'true'
           README_COURSE_CHECK: 'true'     # true = mais preciso, porém faz mais requests
           COURSE_KEYWORDS: 'kdu.edu,acme-bootcamp'        # opcional extras (csv)
-          BOILERPLATE_KEYWORDS: 'project-starter,myseed'  # opcional extras (csv)
+          BATCH_SIZE: '100'
+          QUARTERS_COUNT: '20'
         run: node scripts/mine_ts_react_jest.js
 
       - name: Upload do CSV como artifact

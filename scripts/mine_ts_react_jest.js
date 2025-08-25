@@ -1,5 +1,5 @@
 /* scripts/mine_ts_react_jest.js */
-/* Node 18+ (fetch nativo). Execute local: `node scripts/mine_ts_react_jest.js` */
+/* Node 18+ (fetch nativo). Execute: `node scripts/mine_ts_react_jest.js` */
 
 'use strict';
 
@@ -12,8 +12,11 @@ const path = require('path');
 const OUTPUT_DIR = 'output';
 const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
 
-const BATCH_SIZE = 50; // 1..100 por página GraphQL
-const SLEEP_BETWEEN_PAGES_MS = 1000; // pausa entre páginas para aliviar rate limit
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100', 10); // 1..100 por página GraphQL
+const SLEEP_BETWEEN_PAGES_MS = parseInt(
+  process.env.SLEEP_BETWEEN_PAGES_MS || '1000',
+  10
+); // pausa entre páginas
 
 // Limites globais (env):
 // - MAX_QUALIFIED: quantos repositórios que ATENDEM ao critério antes de parar
@@ -25,7 +28,7 @@ const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10);
 // - REQUIRE_FRONTEND_TESTS: manter apenas repos com testes front-end (Jest e/ou Testing Library)
 const REQUIRE_FRONTEND_TESTS =
   (process.env.REQUIRE_FRONTEND_TESTS || 'true').toLowerCase() === 'true';
-// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates/templates (agora inclui templates)
+// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates/templates
 const EXCLUDE_COURSE_BOILERPLATE =
   (process.env.EXCLUDE_COURSE_BOILERPLATE || 'true').toLowerCase() === 'true';
 // - README_COURSE_CHECK: se true, lê README para detectar curso/boilerplate/template (mais requests)
@@ -41,6 +44,9 @@ const EXTRA_BOILERPLATE_KEYWORDS = (process.env.BOILERPLATE_KEYWORDS || '')
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
+
+// Sharding por trimestres (últimos N trimestres a partir de hoje)
+const QUARTERS_COUNT = parseInt(process.env.QUARTERS_COUNT || '20', 10);
 
 // Finalização graciosa ao receber sinais (ex.: cancelamento do job)
 let stopRequested = false;
@@ -374,7 +380,7 @@ const COURSE_KEYWORDS_DEFAULT = [
   'freecodecamp',
 ];
 
-// Agora inclui "template" e "templates"
+// Inclui "template"/"templates" além de boilerplate/starter/seed...
 const BOILERPLATE_KEYWORDS_DEFAULT = [
   'boilerplate',
   'starter',
@@ -468,14 +474,66 @@ query($queryString: String!, $first: Int!, $after: String) {
 }
 `;
 
-// Queries candidatas (com exclusões para reduzir boilerplates/cursos/templates)
-const QUERY_STRINGS = [
-  'language:TypeScript react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
-  'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
-  'language:TypeScript topic:react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates',
-  'language:TypeScript react in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
-  'language:TypeScript jest in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
+// =========================
+// Sharding por trimestres (pushed)
+// =========================
+
+// “Bases” da query (termos principais)
+const BASES = [
+  'language:TypeScript react jest',
+  'language:TypeScript "react" "jest" in:name,description,readme',
+  'language:TypeScript topic:react jest',
+  'language:TypeScript react in:name,description,readme',
+  'language:TypeScript jest in:name,description,readme',
 ];
+
+// Exclusões (boilerplate, starter, seed, template etc.) e filtros auxiliares
+const EXCLUDE_TERMS =
+  '-boilerplate -starter -seed -tutorial -course -bootcamp -template -templates';
+const EXCLUDE_TOPICS =
+  '-topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates';
+
+// Gera os últimos N trimestres (inclusive o trimestre corrente)
+function buildLastNQuarters(n) {
+  const ranges = [];
+  const now = new Date();
+  // início do trimestre atual (meses 0,3,6,9)
+  const qStartMonth = Math.floor(now.getUTCMonth() / 3) * 3;
+  let cur = new Date(Date.UTC(now.getUTCFullYear(), qStartMonth, 1));
+
+  for (let i = 0; i < n; i++) {
+    const y = cur.getUTCFullYear();
+    const m0 = cur.getUTCMonth(); // 0,3,6,9
+    const qEndMonth = m0 + 2; // 2,5,8,11
+    const lastDay = new Date(Date.UTC(y, qEndMonth + 1, 0)).getUTCDate();
+    const start = `${y}-${String(m0 + 1).padStart(2, '0')}-01`;
+    const finish = `${y}-${String(qEndMonth + 1).padStart(2, '0')}-${String(
+      lastDay
+    ).padStart(2, '0')}`;
+    ranges.push(`pushed:${start}..${finish}`);
+    // volta um trimestre
+    cur = new Date(Date.UTC(y, m0 - 3, 1));
+  }
+  return ranges; // em ordem decrescente (Q_atual, Q-1, ..., Q-(n-1))
+}
+
+function buildQueries() {
+  const quarters = buildLastNQuarters(QUARTERS_COUNT);
+  console.log(
+    `Shard por pushed (trimestres): ${quarters.length} trimestres (últimos ${QUARTERS_COUNT})`
+  );
+  const queries = [];
+  for (const base of BASES) {
+    for (const pushed of quarters) {
+      queries.push(
+        `${base} ${pushed} fork:false archived:false ${EXCLUDE_TOPICS} ${EXCLUDE_TERMS} sort:updated-desc`
+      );
+    }
+  }
+  return queries;
+}
+
+const QUERY_STRINGS = buildQueries();
 
 // =========================
 // Main
@@ -493,6 +551,7 @@ async function main() {
   console.log(
     `Filtros: REQUIRE_FRONTEND_TESTS=${REQUIRE_FRONTEND_TESTS} | EXCLUDE_COURSE_BOILERPLATE(templates)=${EXCLUDE_COURSE_BOILERPLATE} | README_COURSE_CHECK=${README_COURSE_CHECK}`
   );
+  console.log(`Queries geradas: ${QUERY_STRINGS.length}`);
 
   for (const queryString of QUERY_STRINGS) {
     if (reachedLimit || stopRequested) break;
