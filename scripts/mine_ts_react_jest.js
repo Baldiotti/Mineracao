@@ -15,11 +15,32 @@ const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
 const BATCH_SIZE = 50; // 1..100 por página GraphQL
 const SLEEP_BETWEEN_PAGES_MS = 1000; // pausa entre páginas para aliviar rate limit
 
-// Limites globais controláveis por env:
-// - MAX_QUALIFIED: quantos repositórios que ATENDEM ao critério (TS+React+Jest) antes de parar
+// Limites globais (env):
+// - MAX_QUALIFIED: quantos repositórios que ATENDEM ao critério antes de parar
 // - MAX_ANALYZED: total de repositórios analisados (0 = ilimitado)
 const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '1000', 10);
 const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10);
+
+// Filtros (env):
+// - REQUIRE_FRONTEND_TESTS: manter apenas repos com testes front-end (Jest e/ou Testing Library)
+const REQUIRE_FRONTEND_TESTS =
+  (process.env.REQUIRE_FRONTEND_TESTS || 'true').toLowerCase() === 'true';
+// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates
+// - README_COURSE_CHECK: se true, lê README para detectar curso/boilerplate (mais requests)
+const EXCLUDE_COURSE_BOILERPLATE =
+  (process.env.EXCLUDE_COURSE_BOILERPLATE || 'true').toLowerCase() === 'true';
+const README_COURSE_CHECK =
+  (process.env.README_COURSE_CHECK || 'false').toLowerCase() === 'true';
+
+// Palavras-chave extras via env (separadas por vírgula)
+const EXTRA_COURSE_KEYWORDS = (process.env.COURSE_KEYWORDS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const EXTRA_BOILERPLATE_KEYWORDS = (process.env.BOILERPLATE_KEYWORDS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 // Finalização graciosa ao receber sinais (ex.: cancelamento do job)
 let stopRequested = false;
@@ -57,16 +78,28 @@ function writeCsvHeaderIfNeeded() {
   if (!fs.existsSync(CSV_FILE)) {
     fs.writeFileSync(
       CSV_FILE,
-      'Repositorio,Estrelas,TypeScript,React,Jest\n',
+      'Repositorio,Estrelas,TypeScript,React,Jest,FrontendTests,FrontendTestLibs,CourseOrBoilerplate\n',
       'utf-8'
     );
   }
 }
 
-function appendCsvRow({ nameWithOwner, stars, hasTS, hasReact, hasJest }) {
+function appendCsvRow({
+  nameWithOwner,
+  stars,
+  hasTS,
+  hasReact,
+  hasJest,
+  hasFrontendTests,
+  feLibs,
+  isCourseOrBoilerplate,
+}) {
+  const libs = (feLibs || []).join('|');
   const line = `${nameWithOwner},${stars},${hasTS ? 'Sim' : 'Não'},${
     hasReact ? 'Sim' : 'Não'
-  },${hasJest ? 'Sim' : 'Não'}\n`;
+  },${hasJest ? 'Sim' : 'Não'},${hasFrontendTests ? 'Sim' : 'Não'},${libs},${
+    isCourseOrBoilerplate ? 'Sim' : 'Não'
+  }\n`;
   fs.appendFileSync(CSV_FILE, line);
 }
 
@@ -168,14 +201,14 @@ async function ghGET(url) {
 }
 
 // =========================
-// Detecção de tecnologias
+/* Detecção de tecnologias e metadados */
 // =========================
 async function getRepoLanguages(owner, repo) {
   const { status, data } = await ghGET(
     `https://api.github.com/repos/${owner}/${repo}/languages`
   );
   if (status !== 200 || !data) return {};
-  return data; // ex.: { TypeScript: 12345, JavaScript: 6789 }
+  return data;
 }
 
 async function getRepoTopics(owner, repo) {
@@ -204,6 +237,21 @@ async function getRepoContent(owner, repo, pathName) {
   return null;
 }
 
+async function getRepoReadme(owner, repo) {
+  const { status, data } = await ghGET(
+    `https://api.github.com/repos/${owner}/${repo}/readme`
+  );
+  if (status !== 200 || !data) return '';
+  if (data.encoding === 'base64' && data.content) {
+    try {
+      return Buffer.from(data.content, 'base64').toString('utf-8');
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
 function hasDep(pkgJson, name) {
   const deps = pkgJson.dependencies || {};
   const dev = pkgJson.devDependencies || {};
@@ -214,17 +262,41 @@ function pkgHasAnyDep(pkgJson, names) {
   return names.some((n) => hasDep(pkgJson, n));
 }
 
-function scriptsContain(pkgJson, term) {
+function scriptsContain(pkgJson, substrings) {
   const scripts = pkgJson.scripts || {};
-  return Object.values(scripts).some(
-    (s) => typeof s === 'string' && s.toLowerCase().includes(term)
-  );
+  const values = Object.values(scripts)
+    .filter((s) => typeof s === 'string')
+    .map((s) => s.toLowerCase());
+  return substrings.some((sub) => values.some((s) => s.includes(sub)));
+}
+
+// Apenas Jest e Testing Library contam como testes de front-end
+function detectFrontendFromPkg(pkgJson) {
+  const libs = [];
+  const hasJest =
+    pkgHasAnyDep(pkgJson, ['jest', '@jest/globals', 'ts-jest', 'babel-jest']) ||
+    scriptsContain(pkgJson, ['jest']);
+  const hasRTL = pkgHasAnyDep(pkgJson, [
+    '@testing-library/react',
+    '@testing-library/jest-dom',
+    '@testing-library/user-event',
+  ]);
+
+  if (hasRTL) libs.push('testing-library');
+  if (hasJest) libs.push('jest');
+
+  // Regra: front-end tests se tiver Jest ou Testing Library
+  const hasFrontendTests = hasJest || hasRTL;
+  return { hasFrontendTests, libs, hasJest, hasRTL };
 }
 
 async function detectTech(owner, repo) {
   let hasTS = false;
   let hasReact = false;
   let hasJest = false;
+  let hasFrontendTests = false;
+  let feLibs = [];
+  let topics = [];
 
   // Linguagens
   const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
@@ -245,22 +317,15 @@ async function detectTech(owner, repo) {
     if (pkgHasAnyDep(pkgJson, ['react', 'react-dom'])) hasReact = true;
     if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
 
-    if (
-      pkgHasAnyDep(pkgJson, [
-        'jest',
-        '@jest/globals',
-        'ts-jest',
-        'babel-jest',
-      ]) ||
-      scriptsContain(pkgJson, 'jest')
-    ) {
-      hasJest = true;
-    }
+    const fe = detectFrontendFromPkg(pkgJson);
+    hasFrontendTests = fe.hasFrontendTests;
+    feLibs = fe.libs;
+    hasJest = fe.hasJest; // provisório, pode mudar ao encontrar jest.config.*
   }
 
   // Topics ajudam a confirmar React
+  topics = await getRepoTopics(owner, repo).catch(() => []);
   if (!hasReact) {
-    const topics = await getRepoTopics(owner, repo).catch(() => []);
     if (topics.map((t) => t.toLowerCase()).includes('react')) hasReact = true;
   }
 
@@ -273,7 +338,7 @@ async function detectTech(owner, repo) {
     if (tsconfig || tsconfigBase) hasTS = true;
   }
 
-  // Jest config na raiz
+  // Jest config na raiz (ajuda a marcar Jest)
   if (!hasJest) {
     const candidates = [
       'jest.config.js',
@@ -289,9 +354,110 @@ async function detectTech(owner, repo) {
         break;
       }
     }
+    if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
   }
 
-  return { hasTS, hasReact, hasJest };
+  // Ajuste: se detectou Jest por config, também conta como front-end tests (regra atual)
+  if (!hasFrontendTests && hasJest) {
+    hasFrontendTests = true;
+  }
+
+  return { hasTS, hasReact, hasJest, hasFrontendTests, feLibs, topics };
+}
+
+// =========================
+// Curso/Boilerplate
+// =========================
+const COURSE_KEYWORDS_DEFAULT = [
+  'curso',
+  'course',
+  'udemy',
+  'alura',
+  'rocketseat',
+  'bootcamp',
+  'treinamento',
+  'tutorial',
+  'aula',
+  'aulas',
+  'exercicio',
+  'exercício',
+  'exercicios',
+  'exercícios',
+  'learn',
+  'learning',
+  'education',
+  'formacao',
+  'formação',
+  'nanodegree',
+  'codecademy',
+  'freecodecamp',
+];
+
+const BOILERPLATE_KEYWORDS_DEFAULT = [
+  'boilerplate',
+  'starter',
+  'starter-kit',
+  'seed',
+  'scaffold',
+  'skeleton',
+  'quickstart',
+  // intencionalmente NÃO incluí 'template' para reduzir falsos positivos
+];
+
+function textIncludesAny(haystack, keywords) {
+  const lc = (haystack || '').toLowerCase();
+  return keywords.some((k) => lc.includes(k));
+}
+
+async function getRepoReadme(owner, repo) {
+  const { status, data } = await ghGET(
+    `https://api.github.com/repos/${owner}/${repo}/readme`
+  );
+  if (status !== 200 || !data) return '';
+  if (data.encoding === 'base64' && data.content) {
+    try {
+      return Buffer.from(data.content, 'base64').toString('utf-8');
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+async function detectCourseOrBoilerplate(
+  owner,
+  repo,
+  name,
+  description,
+  topics
+) {
+  const courseKeywords = [...COURSE_KEYWORDS_DEFAULT, ...EXTRA_COURSE_KEYWORDS];
+  const boilerKeywords = [
+    ...BOILERPLATE_KEYWORDS_DEFAULT,
+    ...EXTRA_BOILERPLATE_KEYWORDS,
+  ];
+
+  const nameStr = (name || '').toLowerCase();
+  const descStr = (description || '').toLowerCase();
+  const topicsStr = (topics || []).map((t) => t.toLowerCase()).join(' ');
+
+  let isCourse =
+    textIncludesAny(nameStr, courseKeywords) ||
+    textIncludesAny(descStr, courseKeywords) ||
+    textIncludesAny(topicsStr, courseKeywords);
+  let isBoiler =
+    textIncludesAny(nameStr, boilerKeywords) ||
+    textIncludesAny(descStr, boilerKeywords) ||
+    textIncludesAny(topicsStr, boilerKeywords);
+
+  if (!isCourse && !isBoiler && README_COURSE_CHECK) {
+    const readme = await getRepoReadme(owner, repo).catch(() => '');
+    const readme2k = (readme || '').slice(0, 4000).toLowerCase();
+    if (textIncludesAny(readme2k, courseKeywords)) isCourse = true;
+    if (textIncludesAny(readme2k, boilerKeywords)) isBoiler = true;
+  }
+
+  return { isCourseOrBoilerplate: isCourse || isBoiler, isCourse, isBoiler };
 }
 
 // =========================
@@ -305,6 +471,7 @@ query($queryString: String!, $first: Int!, $after: String) {
       node {
         ... on Repository {
           name
+          description
           owner { login }
           stargazerCount
         }
@@ -318,17 +485,17 @@ query($queryString: String!, $first: Int!, $after: String) {
 }
 `;
 
-// Queries candidatas
+// Queries candidatas (com exclusões básicas para reduzir boilerplates/cursos)
 const QUERY_STRINGS = [
-  'language:TypeScript react jest sort:stars-desc',
-  'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc',
-  'language:TypeScript topic:react jest sort:stars-desc',
-  'language:TypeScript react in:name,description,readme sort:stars-desc',
-  'language:TypeScript jest in:name,description,readme sort:stars-desc',
+  'language:TypeScript react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course',
+  'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
+  'language:TypeScript topic:react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course',
+  'language:TypeScript react in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
+  'language:TypeScript jest in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
 ];
 
 // =========================
-/* Main */
+// Main
 // =========================
 async function main() {
   writeCsvHeaderIfNeeded();
@@ -339,6 +506,9 @@ async function main() {
 
   console.log(
     `Limites: MAX_QUALIFIED=${MAX_QUALIFIED} | MAX_ANALYZED=${MAX_ANALYZED}`
+  );
+  console.log(
+    `Filtros: REQUIRE_FRONTEND_TESTS=${REQUIRE_FRONTEND_TESTS} | EXCLUDE_COURSE_BOILERPLATE=${EXCLUDE_COURSE_BOILERPLATE} | README_COURSE_CHECK=${README_COURSE_CHECK}`
   );
 
   for (const queryString of QUERY_STRINGS) {
@@ -377,7 +547,6 @@ async function main() {
         if (processed.has(nameWithOwner)) continue;
         processed.add(nameWithOwner);
 
-        // Checagens de parada
         if (MAX_ANALYZED > 0 && processed.size > MAX_ANALYZED) {
           console.log(`Atingiu MAX_ANALYZED=${MAX_ANALYZED}. Finalizando...`);
           reachedLimit = true;
@@ -390,31 +559,61 @@ async function main() {
 
         try {
           const tech = await detectTech(repo.owner.login, repo.name);
+          const courseFlag = await detectCourseOrBoilerplate(
+            repo.owner.login,
+            repo.name,
+            repo.name,
+            repo.description,
+            tech.topics
+          );
 
-          if (tech.hasTS && tech.hasReact && tech.hasJest) {
-            appendCsvRow({
-              nameWithOwner,
-              stars: repo.stargazerCount,
-              hasTS: true,
-              hasReact: true,
-              hasJest: true,
-            });
-            totalQualified++;
+          // Aplica filtros
+          if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
             console.log(
-              `✅ Registrado: ${nameWithOwner} | Total qualificados: ${totalQualified}`
+              `⏭️ Excluído por curso/boilerplate (${
+                courseFlag.isCourse ? 'curso' : 'boilerplate'
+              }): ${nameWithOwner}`
             );
+            continue;
+          }
 
-            if (totalQualified >= MAX_QUALIFIED) {
-              console.log(
-                `Atingiu MAX_QUALIFIED=${MAX_QUALIFIED}. Finalizando...`
-              );
-              reachedLimit = true;
-              break;
-            }
-          } else {
+          if (!(tech.hasTS && tech.hasReact)) {
             console.log(
-              `❌ Não atende (TS:${tech.hasTS} React:${tech.hasReact} Jest:${tech.hasJest}): ${nameWithOwner}`
+              `❌ Falta TS ou React (TS:${tech.hasTS} React:${tech.hasReact}): ${nameWithOwner}`
             );
+            continue;
+          }
+
+          if (REQUIRE_FRONTEND_TESTS && !tech.hasFrontendTests) {
+            console.log(
+              `❌ Sem testes de front-end (Jest/Testing Library) detectados: ${nameWithOwner}`
+            );
+            continue;
+          }
+
+          // Mantém se passou
+          appendCsvRow({
+            nameWithOwner,
+            stars: repo.stargazerCount,
+            hasTS: tech.hasTS,
+            hasReact: tech.hasReact,
+            hasJest: tech.hasJest,
+            hasFrontendTests: tech.hasFrontendTests,
+            feLibs: tech.feLibs,
+            isCourseOrBoilerplate: courseFlag.isCourseOrBoilerplate,
+          });
+
+          totalQualified++;
+          console.log(
+            `✅ Registrado: ${nameWithOwner} | Total qualificados: ${totalQualified}`
+          );
+
+          if (totalQualified >= MAX_QUALIFIED) {
+            console.log(
+              `Atingiu MAX_QUALIFIED=${MAX_QUALIFIED}. Finalizando...`
+            );
+            reachedLimit = true;
+            break;
           }
         } catch (err) {
           console.warn(`⚠️ Falha ao analisar ${nameWithOwner}: ${err.message}`);
@@ -438,7 +637,7 @@ async function main() {
 
   console.log('\n🎉 ===== RESUMO =====');
   console.log(`🔢 Repositórios únicos analisados: ${processed.size}`);
-  console.log(`✅ Repositórios (TS+React+Jest): ${totalQualified}`);
+  console.log(`✅ Repositórios mantidos (pós-filtros): ${totalQualified}`);
   console.log(`📁 CSV gerado: ${CSV_FILE}`);
 }
 

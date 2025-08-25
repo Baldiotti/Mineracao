@@ -26,9 +26,14 @@ jobs:
 
       - name: Rodar mineração
         env:
-          MAX_QUALIFIED: '1000'  # para parar com ~1000 repositórios que atendem ao critério
-          MAX_ANALYZED: '10000' # opcional: limitar total analisado
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_QUALIFIED: '1000'            # para parar após ~1000 aprovados
+          MAX_ANALYZED: '10000'           # opcional: limite de analisados
+          REQUIRE_FRONTEND_TESTS: 'true'   # mantém só quem tem testes de front-end
+          EXCLUDE_COURSE_BOILERPLATE: 'true'
+          README_COURSE_CHECK: 'true'     # true = mais preciso, porém faz mais requests
+          COURSE_KEYWORDS: 'kdu.edu,acme-bootcamp'        # opcional extras (csv)
+          BOILERPLATE_KEYWORDS: 'project-starter,myseed'  # opcional extras (csv)
         run: node scripts/mine_ts_react_jest.js
 
       - name: Upload do CSV como artifact
