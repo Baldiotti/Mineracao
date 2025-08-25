@@ -47,11 +47,7 @@ function appendCsvRow({ nameWithOwner, stars, hasTS, hasReact, hasJest }) {
   fs.appendFileSync(CSV_FILE, line);
 }
 
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit = {},
-  timeoutMs = 30000
-) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
 

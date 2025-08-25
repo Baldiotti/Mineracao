@@ -27,7 +27,7 @@ jobs:
       - name: Rodar mineração
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/mine_ts_react_jest.ts
+        run: node scripts/mine_ts_react_jest.js
 
       - name: Upload do CSV como artifact
         uses: actions/upload-artifact@v4
