@@ -1,26 +1,49 @@
+/* scripts/mine_ts_react_jest.js */
+/* Node 18+ (fetch nativo). Execute local: `node scripts/mine_ts_react_jest.js` */
+
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
 
-// Configurações
+// =========================
+// Configurações principais
+// =========================
 const OUTPUT_DIR = 'output';
 const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
-const MAX_RESULTS_PER_QUERY = 500; // máx por query para limitar esforço
-const BATCH_SIZE = 50; // 1..100 por paginação GraphQL
-const SLEEP_BETWEEN_PAGES_MS = 1000;
 
-// Token (Actions preenche GITHUB_TOKEN automaticamente)
+const BATCH_SIZE = 50; // 1..100 por página GraphQL
+const SLEEP_BETWEEN_PAGES_MS = 1000; // pausa entre páginas para aliviar rate limit
+
+// Limites globais controláveis por env:
+// - MAX_QUALIFIED: quantos repositórios que ATENDEM ao critério (TS+React+Jest) antes de parar
+// - MAX_ANALYZED: total de repositórios analisados (0 = ilimitado)
+const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '1000', 10);
+const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10);
+
+// Finalização graciosa ao receber sinais (ex.: cancelamento do job)
+let stopRequested = false;
+process.on('SIGTERM', () => {
+  stopRequested = true;
+});
+process.on('SIGINT', () => {
+  stopRequested = true;
+});
+
+// Token (Actions injeta GITHUB_TOKEN automaticamente)
 const GITHUB_TOKEN =
   process.env.GITHUB_TOKEN || process.env.PAT || process.env.GH_TOKEN;
 
 if (!GITHUB_TOKEN) {
   console.error(
-    'Erro: GITHUB_TOKEN não encontrado. No Actions, use secrets.GITHUB_TOKEN. Localmente, exporte GITHUB_TOKEN ou use um .env.'
+    'Erro: GITHUB_TOKEN não encontrado. No Actions, use secrets.GITHUB_TOKEN. Local: exporte GITHUB_TOKEN.'
   );
   process.exit(1);
 }
 
+// =========================
+// Utilitários
+// =========================
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -72,7 +95,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
 }
 
 async function handleRateLimit(res) {
-  // Se a API disser que o rate limit acabou, aguarde até o reset
   if (res.status === 403) {
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = res.headers.get('x-ratelimit-reset');
@@ -83,7 +105,7 @@ async function handleRateLimit(res) {
         `Rate limit atingido. Aguardando ${(waitMs / 1000).toFixed(0)}s...`
       );
       await sleep(waitMs);
-      return true; // sinaliza para tentar novamente
+      return true; // tentar novamente
     }
   }
   return false;
@@ -94,9 +116,7 @@ async function ghGraphQL(query, variables) {
     const res = await fetchWithTimeout('https://api.github.com/graphql', {
       method: 'POST',
       body: JSON.stringify({ query, variables }),
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
     });
 
     if (res.status === 403) {
@@ -116,8 +136,7 @@ async function ghGraphQL(query, variables) {
 
     const json = await res.json();
     if (json.errors) {
-      const msg = JSON.stringify(json.errors);
-      throw new Error(`GraphQL errors: ${msg}`);
+      throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
     }
     return json.data;
   }
@@ -148,6 +167,9 @@ async function ghGET(url) {
   }
 }
 
+// =========================
+// Detecção de tecnologias
+// =========================
 async function getRepoLanguages(owner, repo) {
   const { status, data } = await ghGET(
     `https://api.github.com/repos/${owner}/${repo}/languages`
@@ -199,19 +221,18 @@ function scriptsContain(pkgJson, term) {
   );
 }
 
-// Heurísticas para TS/React/Jest
 async function detectTech(owner, repo) {
   let hasTS = false;
   let hasReact = false;
   let hasJest = false;
 
-  // 1) Linguagens
+  // Linguagens
   const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
   if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0) {
     hasTS = true;
   }
 
-  // 2) package.json na raiz
+  // package.json
   const pkgText = await getRepoContent(owner, repo, 'package.json');
   let pkgJson = null;
   if (pkgText) {
@@ -221,16 +242,9 @@ async function detectTech(owner, repo) {
   }
 
   if (pkgJson) {
-    // React via deps
-    if (pkgHasAnyDep(pkgJson, ['react', 'react-dom'])) {
-      hasReact = true;
-    }
-    // TS via deps (fallback se linguagens não apontar)
-    if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) {
-      hasTS = true;
-    }
+    if (pkgHasAnyDep(pkgJson, ['react', 'react-dom'])) hasReact = true;
+    if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
 
-    // Jest via deps ou scripts
     if (
       pkgHasAnyDep(pkgJson, [
         'jest',
@@ -244,25 +258,23 @@ async function detectTech(owner, repo) {
     }
   }
 
-  // 3) Topics (às vezes repos marcam "react")
+  // Topics ajudam a confirmar React
   if (!hasReact) {
     const topics = await getRepoTopics(owner, repo).catch(() => []);
-    if (topics.map((t) => t.toLowerCase()).includes('react')) {
-      hasReact = true;
-    }
+    if (topics.map((t) => t.toLowerCase()).includes('react')) hasReact = true;
   }
 
-  // 4) Arquivos de config que ajudam a confirmar
+  // tsconfig.* confirma TS em alguns casos
   if (!hasTS) {
     const tsconfig = await getRepoContent(owner, repo, 'tsconfig.json');
-    const tsconfigBase = !tsconfig
-      ? await getRepoContent(owner, repo, 'tsconfig.base.json')
-      : null;
+    const tsconfigBase = tsconfig
+      ? null
+      : await getRepoContent(owner, repo, 'tsconfig.base.json');
     if (tsconfig || tsconfigBase) hasTS = true;
   }
 
+  // Jest config na raiz
   if (!hasJest) {
-    // Qualquer um desses existir na raiz
     const candidates = [
       'jest.config.js',
       'jest.config.cjs',
@@ -282,7 +294,9 @@ async function detectTech(owner, repo) {
   return { hasTS, hasReact, hasJest };
 }
 
-// Query GraphQL para buscar repositórios
+// =========================
+// Busca GraphQL
+// =========================
 const SEARCH_REPOS = `
 query($queryString: String!, $first: Int!, $after: String) {
   search(query: $queryString, type: REPOSITORY, first: $first, after: $after) {
@@ -304,29 +318,36 @@ query($queryString: String!, $first: Int!, $after: String) {
 }
 `;
 
-// Queries: tentamos várias combinações para encontrar candidatos
+// Queries candidatas
 const QUERY_STRINGS = [
-  // Foco: TS + React + Jest
   'language:TypeScript react jest sort:stars-desc',
   'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc',
   'language:TypeScript topic:react jest sort:stars-desc',
-  // fallback ampliado
   'language:TypeScript react in:name,description,readme sort:stars-desc',
   'language:TypeScript jest in:name,description,readme sort:stars-desc',
 ];
 
+// =========================
+/* Main */
+// =========================
 async function main() {
   writeCsvHeaderIfNeeded();
 
   const processed = new Set();
   let totalQualified = 0;
+  let reachedLimit = false;
+
+  console.log(
+    `Limites: MAX_QUALIFIED=${MAX_QUALIFIED} | MAX_ANALYZED=${MAX_ANALYZED}`
+  );
 
   for (const queryString of QUERY_STRINGS) {
+    if (reachedLimit || stopRequested) break;
+
     console.log(`\n🔎 Iniciando query: "${queryString}"`);
-    let foundThisQuery = 0;
     let after = null;
 
-    while (foundThisQuery < MAX_RESULTS_PER_QUERY) {
+    while (!reachedLimit && !stopRequested) {
       const vars = { queryString, first: BATCH_SIZE, after };
 
       let data;
@@ -348,11 +369,20 @@ async function main() {
       );
 
       for (const edge of edges) {
+        if (reachedLimit || stopRequested) break;
+
         const repo = edge.node;
         const nameWithOwner = `${repo.owner.login}/${repo.name}`;
 
         if (processed.has(nameWithOwner)) continue;
         processed.add(nameWithOwner);
+
+        // Checagens de parada
+        if (MAX_ANALYZED > 0 && processed.size > MAX_ANALYZED) {
+          console.log(`Atingiu MAX_ANALYZED=${MAX_ANALYZED}. Finalizando...`);
+          reachedLimit = true;
+          break;
+        }
 
         console.log(
           `🔍 Analisando: ${nameWithOwner} (${repo.stargazerCount}⭐)`
@@ -370,8 +400,17 @@ async function main() {
               hasJest: true,
             });
             totalQualified++;
-            foundThisQuery++;
-            console.log(`✅ Registrado: ${nameWithOwner}`);
+            console.log(
+              `✅ Registrado: ${nameWithOwner} | Total qualificados: ${totalQualified}`
+            );
+
+            if (totalQualified >= MAX_QUALIFIED) {
+              console.log(
+                `Atingiu MAX_QUALIFIED=${MAX_QUALIFIED}. Finalizando...`
+              );
+              reachedLimit = true;
+              break;
+            }
           } else {
             console.log(
               `❌ Não atende (TS:${tech.hasTS} React:${tech.hasReact} Jest:${tech.hasJest}): ${nameWithOwner}`
@@ -382,6 +421,8 @@ async function main() {
         }
       }
 
+      if (reachedLimit || stopRequested) break;
+
       if (!data.search.pageInfo.hasNextPage) {
         console.log('🏁 Fim da paginação para esta query.');
         break;
@@ -391,9 +432,7 @@ async function main() {
       await sleep(SLEEP_BETWEEN_PAGES_MS);
     }
 
-    console.log(
-      `📊 Query finalizada: "${queryString}" | Qualificados: ${foundThisQuery}`
-    );
+    console.log(`📊 Query finalizada: "${queryString}"`);
     await sleep(1500);
   }
 

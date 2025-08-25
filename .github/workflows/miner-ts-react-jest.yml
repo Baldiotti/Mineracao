@@ -26,10 +26,13 @@ jobs:
 
       - name: Rodar mineração
         env:
+          MAX_QUALIFIED: '1000'  # para parar com ~1000 repositórios que atendem ao critério
+          MAX_ANALYZED: '10000' # opcional: limitar total analisado
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/mine_ts_react_jest.js
 
       - name: Upload do CSV como artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: repos-ts-react-jest
