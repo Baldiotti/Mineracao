@@ -28,7 +28,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAX_QUALIFIED: '1000'            # para parar após ~1000 aprovados
-          MAX_ANALYZED: '10000'           # opcional: limite de analisados
+          MAX_ANALYZED: '20000'           # opcional: limite de analisados
           REQUIRE_FRONTEND_TESTS: 'true'   # mantém só quem tem testes de front-end
           EXCLUDE_COURSE_BOILERPLATE: 'true'
           README_COURSE_CHECK: 'true'     # true = mais preciso, porém faz mais requests

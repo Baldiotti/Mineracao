@@ -25,10 +25,10 @@ const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10);
 // - REQUIRE_FRONTEND_TESTS: manter apenas repos com testes front-end (Jest e/ou Testing Library)
 const REQUIRE_FRONTEND_TESTS =
   (process.env.REQUIRE_FRONTEND_TESTS || 'true').toLowerCase() === 'true';
-// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates
-// - README_COURSE_CHECK: se true, lê README para detectar curso/boilerplate (mais requests)
+// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates/templates (agora inclui templates)
 const EXCLUDE_COURSE_BOILERPLATE =
   (process.env.EXCLUDE_COURSE_BOILERPLATE || 'true').toLowerCase() === 'true';
+// - README_COURSE_CHECK: se true, lê README para detectar curso/boilerplate/template (mais requests)
 const README_COURSE_CHECK =
   (process.env.README_COURSE_CHECK || 'false').toLowerCase() === 'true';
 
@@ -78,7 +78,7 @@ function writeCsvHeaderIfNeeded() {
   if (!fs.existsSync(CSV_FILE)) {
     fs.writeFileSync(
       CSV_FILE,
-      'Repositorio,Estrelas,TypeScript,React,Jest,FrontendTests,FrontendTestLibs,CourseOrBoilerplate\n',
+      'Repositorio,Link,Estrelas,TypeScript,React,Jest,FrontendTestLibs\n',
       'utf-8'
     );
   }
@@ -90,16 +90,13 @@ function appendCsvRow({
   hasTS,
   hasReact,
   hasJest,
-  hasFrontendTests,
   feLibs,
-  isCourseOrBoilerplate,
 }) {
   const libs = (feLibs || []).join('|');
-  const line = `${nameWithOwner},${stars},${hasTS ? 'Sim' : 'Não'},${
+  const link = `https://github.com/${nameWithOwner}`;
+  const line = `${nameWithOwner},${link},${stars},${hasTS ? 'Sim' : 'Não'},${
     hasReact ? 'Sim' : 'Não'
-  },${hasJest ? 'Sim' : 'Não'},${hasFrontendTests ? 'Sim' : 'Não'},${libs},${
-    isCourseOrBoilerplate ? 'Sim' : 'Não'
-  }\n`;
+  },${hasJest ? 'Sim' : 'Não'},${libs}\n`;
   fs.appendFileSync(CSV_FILE, line);
 }
 
@@ -237,21 +234,6 @@ async function getRepoContent(owner, repo, pathName) {
   return null;
 }
 
-async function getRepoReadme(owner, repo) {
-  const { status, data } = await ghGET(
-    `https://api.github.com/repos/${owner}/${repo}/readme`
-  );
-  if (status !== 200 || !data) return '';
-  if (data.encoding === 'base64' && data.content) {
-    try {
-      return Buffer.from(data.content, 'base64').toString('utf-8');
-    } catch {
-      return '';
-    }
-  }
-  return '';
-}
-
 function hasDep(pkgJson, name) {
   const deps = pkgJson.dependencies || {};
   const dev = pkgJson.devDependencies || {};
@@ -285,7 +267,6 @@ function detectFrontendFromPkg(pkgJson) {
   if (hasRTL) libs.push('testing-library');
   if (hasJest) libs.push('jest');
 
-  // Regra: front-end tests se tiver Jest ou Testing Library
   const hasFrontendTests = hasJest || hasRTL;
   return { hasFrontendTests, libs, hasJest, hasRTL };
 }
@@ -320,7 +301,7 @@ async function detectTech(owner, repo) {
     const fe = detectFrontendFromPkg(pkgJson);
     hasFrontendTests = fe.hasFrontendTests;
     feLibs = fe.libs;
-    hasJest = fe.hasJest; // provisório, pode mudar ao encontrar jest.config.*
+    hasJest = fe.hasJest; // provisório; pode ser confirmado por jest.config.*
   }
 
   // Topics ajudam a confirmar React
@@ -357,7 +338,7 @@ async function detectTech(owner, repo) {
     if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
   }
 
-  // Ajuste: se detectou Jest por config, também conta como front-end tests (regra atual)
+  // Se detectou Jest por config, também conta como front-end tests (regra atual)
   if (!hasFrontendTests && hasJest) {
     hasFrontendTests = true;
   }
@@ -366,7 +347,7 @@ async function detectTech(owner, repo) {
 }
 
 // =========================
-// Curso/Boilerplate
+// Curso/Boilerplate/Template
 // =========================
 const COURSE_KEYWORDS_DEFAULT = [
   'curso',
@@ -393,6 +374,7 @@ const COURSE_KEYWORDS_DEFAULT = [
   'freecodecamp',
 ];
 
+// Agora inclui "template" e "templates"
 const BOILERPLATE_KEYWORDS_DEFAULT = [
   'boilerplate',
   'starter',
@@ -401,7 +383,8 @@ const BOILERPLATE_KEYWORDS_DEFAULT = [
   'scaffold',
   'skeleton',
   'quickstart',
-  // intencionalmente NÃO incluí 'template' para reduzir falsos positivos
+  'template',
+  'templates',
 ];
 
 function textIncludesAny(haystack, keywords) {
@@ -445,19 +428,19 @@ async function detectCourseOrBoilerplate(
     textIncludesAny(nameStr, courseKeywords) ||
     textIncludesAny(descStr, courseKeywords) ||
     textIncludesAny(topicsStr, courseKeywords);
-  let isBoiler =
+  let isBoilerOrTemplate =
     textIncludesAny(nameStr, boilerKeywords) ||
     textIncludesAny(descStr, boilerKeywords) ||
     textIncludesAny(topicsStr, boilerKeywords);
 
-  if (!isCourse && !isBoiler && README_COURSE_CHECK) {
+  if (!isCourse && !isBoilerOrTemplate && README_COURSE_CHECK) {
     const readme = await getRepoReadme(owner, repo).catch(() => '');
     const readme2k = (readme || '').slice(0, 4000).toLowerCase();
     if (textIncludesAny(readme2k, courseKeywords)) isCourse = true;
-    if (textIncludesAny(readme2k, boilerKeywords)) isBoiler = true;
+    if (textIncludesAny(readme2k, boilerKeywords)) isBoilerOrTemplate = true;
   }
 
-  return { isCourseOrBoilerplate: isCourse || isBoiler, isCourse, isBoiler };
+  return { isCourseOrBoilerplate: isCourse || isBoilerOrTemplate };
 }
 
 // =========================
@@ -485,13 +468,13 @@ query($queryString: String!, $first: Int!, $after: String) {
 }
 `;
 
-// Queries candidatas (com exclusões básicas para reduzir boilerplates/cursos)
+// Queries candidatas (com exclusões para reduzir boilerplates/cursos/templates)
 const QUERY_STRINGS = [
-  'language:TypeScript react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course',
-  'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
-  'language:TypeScript topic:react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course',
-  'language:TypeScript react in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
-  'language:TypeScript jest in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp',
+  'language:TypeScript react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
+  'language:TypeScript "react" "jest" in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
+  'language:TypeScript topic:react jest sort:stars-desc -topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates',
+  'language:TypeScript react in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
+  'language:TypeScript jest in:name,description,readme sort:stars-desc -boilerplate -starter -seed -tutorial -course -bootcamp -template -templates',
 ];
 
 // =========================
@@ -508,7 +491,7 @@ async function main() {
     `Limites: MAX_QUALIFIED=${MAX_QUALIFIED} | MAX_ANALYZED=${MAX_ANALYZED}`
   );
   console.log(
-    `Filtros: REQUIRE_FRONTEND_TESTS=${REQUIRE_FRONTEND_TESTS} | EXCLUDE_COURSE_BOILERPLATE=${EXCLUDE_COURSE_BOILERPLATE} | README_COURSE_CHECK=${README_COURSE_CHECK}`
+    `Filtros: REQUIRE_FRONTEND_TESTS=${REQUIRE_FRONTEND_TESTS} | EXCLUDE_COURSE_BOILERPLATE(templates)=${EXCLUDE_COURSE_BOILERPLATE} | README_COURSE_CHECK=${README_COURSE_CHECK}`
   );
 
   for (const queryString of QUERY_STRINGS) {
@@ -570,9 +553,7 @@ async function main() {
           // Aplica filtros
           if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
             console.log(
-              `⏭️ Excluído por curso/boilerplate (${
-                courseFlag.isCourse ? 'curso' : 'boilerplate'
-              }): ${nameWithOwner}`
+              `⏭️ Excluído por curso/boilerplate/template: ${nameWithOwner}`
             );
             continue;
           }
@@ -598,9 +579,7 @@ async function main() {
             hasTS: tech.hasTS,
             hasReact: tech.hasReact,
             hasJest: tech.hasJest,
-            hasFrontendTests: tech.hasFrontendTests,
             feLibs: tech.feLibs,
-            isCourseOrBoilerplate: courseFlag.isCourseOrBoilerplate,
           });
 
           totalQualified++;
