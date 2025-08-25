@@ -35,6 +35,8 @@ jobs:
           COURSE_KEYWORDS: 'kdu.edu,acme-bootcamp'        # opcional extras (csv)
           BATCH_SIZE: '100'
           QUARTERS_COUNT: '20'
+          APPLY_TEXT_EXCLUDES: 'false'
+          EXCLUDE_TERMS: '-boilerplate -starter -seed -tutorial -course -bootcamp -template -templates'
         run: node scripts/mine_ts_react_jest.js
 
       - name: Upload do CSV como artifact

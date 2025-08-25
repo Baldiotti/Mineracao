@@ -45,7 +45,7 @@ const EXTRA_BOILERPLATE_KEYWORDS = (process.env.BOILERPLATE_KEYWORDS || '')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Sharding por trimestres (últimos N trimestres a partir de hoje)
+// Sharding por trimestres (últimos N trimestres a partir do atual)
 const QUARTERS_COUNT = parseInt(process.env.QUARTERS_COUNT || '20', 10);
 
 // Finalização graciosa ao receber sinais (ex.: cancelamento do job)
@@ -307,7 +307,7 @@ async function detectTech(owner, repo) {
     const fe = detectFrontendFromPkg(pkgJson);
     hasFrontendTests = fe.hasFrontendTests;
     feLibs = fe.libs;
-    hasJest = fe.hasJest; // provisório; pode ser confirmado por jest.config.*
+    hasJest = fe.hasJest; // pode ser confirmado por jest.config.*
   }
 
   // Topics ajudam a confirmar React
@@ -380,7 +380,6 @@ const COURSE_KEYWORDS_DEFAULT = [
   'freecodecamp',
 ];
 
-// Inclui "template"/"templates" além de boilerplate/starter/seed...
 const BOILERPLATE_KEYWORDS_DEFAULT = [
   'boilerplate',
   'starter',
@@ -475,30 +474,35 @@ query($queryString: String!, $first: Int!, $after: String) {
 `;
 
 // =========================
-// Sharding por trimestres (pushed)
+// Sharding por trimestres (pushed) — sem exclusões textuais por padrão
 // =========================
 
-// “Bases” da query (termos principais)
+// Bases amplas (TS + React). A detecção de Jest/RTL fica no código.
 const BASES = [
-  'language:TypeScript react jest',
-  'language:TypeScript "react" "jest" in:name,description,readme',
-  'language:TypeScript topic:react jest',
-  'language:TypeScript react in:name,description,readme',
-  'language:TypeScript jest in:name,description,readme',
+  'language:TypeScript react',
+  'language:TypeScript topic:react',
+  'language:TypeScript "react" in:name,description,readme',
 ];
 
-// Exclusões (boilerplate, starter, seed, template etc.) e filtros auxiliares
-const EXCLUDE_TERMS =
-  '-boilerplate -starter -seed -tutorial -course -bootcamp -template -templates';
-const EXCLUDE_TOPICS =
-  '-topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates';
+// Exclusões por tópico (menos agressivas). Personalizável por env.
+const EXCLUDE_TOPICS = (
+  process.env.EXCLUDE_TOPICS ||
+  '-topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates'
+).trim();
 
-// Gera os últimos N trimestres (inclusive o trimestre corrente)
+// Termos de exclusão textuais (desativado por padrão). Ative com APPLY_TEXT_EXCLUDES=true.
+const EXCLUDE_TERMS = (
+  process.env.EXCLUDE_TERMS ||
+  '-boilerplate -starter -seed -tutorial -course -bootcamp -template -templates'
+).trim();
+const APPLY_TEXT_EXCLUDES =
+  (process.env.APPLY_TEXT_EXCLUDES || 'false').toLowerCase() === 'true';
+
+// Gera os últimos N trimestres (inclui o trimestre atual)
 function buildLastNQuarters(n) {
   const ranges = [];
   const now = new Date();
-  // início do trimestre atual (meses 0,3,6,9)
-  const qStartMonth = Math.floor(now.getUTCMonth() / 3) * 3;
+  const qStartMonth = Math.floor(now.getUTCMonth() / 3) * 3; // 0,3,6,9
   let cur = new Date(Date.UTC(now.getUTCFullYear(), qStartMonth, 1));
 
   for (let i = 0; i < n; i++) {
@@ -511,23 +515,30 @@ function buildLastNQuarters(n) {
       lastDay
     ).padStart(2, '0')}`;
     ranges.push(`pushed:${start}..${finish}`);
-    // volta um trimestre
+    // volta 1 trimestre
     cur = new Date(Date.UTC(y, m0 - 3, 1));
   }
-  return ranges; // em ordem decrescente (Q_atual, Q-1, ..., Q-(n-1))
+  return ranges; // ordem: Q_atual, Q-1, ..., Q-(n-1)
 }
 
 function buildQueries() {
   const quarters = buildLastNQuarters(QUARTERS_COUNT);
   console.log(
-    `Shard por pushed (trimestres): ${quarters.length} trimestres (últimos ${QUARTERS_COUNT})`
+    `Shard por pushed (trimestres): ${quarters.length} (últimos ${QUARTERS_COUNT})`
   );
   const queries = [];
+  const excl = [EXCLUDE_TOPICS, APPLY_TEXT_EXCLUDES ? EXCLUDE_TERMS : '']
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
   for (const base of BASES) {
     for (const pushed of quarters) {
-      queries.push(
-        `${base} ${pushed} fork:false archived:false ${EXCLUDE_TOPICS} ${EXCLUDE_TERMS} sort:updated-desc`
-      );
+      // Importante: sem "sort:" dentro do texto da query
+      const q = [base, pushed, 'fork:false', 'archived:false', excl]
+        .filter(Boolean)
+        .join(' ');
+      queries.push(q);
     }
   }
   return queries;
@@ -571,14 +582,14 @@ async function main() {
       }
 
       const edges = data?.search?.edges || [];
+      const avail = data?.search?.repositoryCount ?? 'N/A';
+      console.log(
+        `📈 repositoryCount≈${avail} | Página com ${edges.length} itens`
+      );
       if (edges.length === 0) {
         console.log('📄 Sem mais resultados nesta página.');
         break;
       }
-
-      console.log(
-        `📈 Disponíveis (aprox.): ${data.search.repositoryCount} | Página com ${edges.length} itens`
-      );
 
       for (const edge of edges) {
         if (reachedLimit || stopRequested) break;
@@ -589,7 +600,7 @@ async function main() {
         if (processed.has(nameWithOwner)) continue;
         processed.add(nameWithOwner);
 
-        if (MAX_ANALYZED > 0 && processed.size > MAX_ANALYZED) {
+        if (MAX_ANALYZED > 0 && processed.size >= MAX_ANALYZED) {
           console.log(`Atingiu MAX_ANALYZED=${MAX_ANALYZED}. Finalizando...`);
           reachedLimit = true;
           break;
@@ -609,7 +620,7 @@ async function main() {
             tech.topics
           );
 
-          // Aplica filtros
+          // Filtros
           if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
             console.log(
               `⏭️ Excluído por curso/boilerplate/template: ${nameWithOwner}`
@@ -670,7 +681,7 @@ async function main() {
     }
 
     console.log(`📊 Query finalizada: "${queryString}"`);
-    await sleep(1500);
+    await sleep(1000);
   }
 
   console.log('\n🎉 ===== RESUMO =====');
