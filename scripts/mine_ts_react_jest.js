@@ -7,46 +7,44 @@ const fs = require('fs');
 const path = require('path');
 
 // =========================
-// Configurações principais
+// Config
 // =========================
 const OUTPUT_DIR = 'output';
 const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
 
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100', 10); // 1..100 por página GraphQL
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100', 10); // por página (REST: per_page máx 100)
 const SLEEP_BETWEEN_PAGES_MS = parseInt(
-  process.env.SLEEP_BETWEEN_PAGES_MS || '1000',
+  process.env.SLEEP_BETWEEN_PAGES_MS || '800',
   10
-); // pausa entre páginas
+);
 
-// Limites globais (env):
-// - MAX_QUALIFIED: quantos repositórios que ATENDEM ao critério antes de parar
-// - MAX_ANALYZED: total de repositórios analisados (0 = ilimitado)
+// Limites globais
 const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '1000', 10);
-const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10);
+const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10); // 0 = ilimitado
 
-// Filtros (env):
-// - REQUIRE_FRONTEND_TESTS: manter apenas repos com testes front-end (Jest e/ou Testing Library)
+// Filtros
 const REQUIRE_FRONTEND_TESTS =
   (process.env.REQUIRE_FRONTEND_TESTS || 'true').toLowerCase() === 'true';
-// - EXCLUDE_COURSE_BOILERPLATE: excluir cursos/boilerplates/templates
 const EXCLUDE_COURSE_BOILERPLATE =
   (process.env.EXCLUDE_COURSE_BOILERPLATE || 'true').toLowerCase() === 'true';
-// - README_COURSE_CHECK: se true, lê README para detectar curso/boilerplate/template (mais requests)
 const README_COURSE_CHECK =
   (process.env.README_COURSE_CHECK || 'false').toLowerCase() === 'true';
 
-// Palavras-chave extras via env (separadas por vírgula)
-const EXTRA_COURSE_KEYWORDS = (process.env.COURSE_KEYWORDS || '')
-  .split(',')
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
-const EXTRA_BOILERPLATE_KEYWORDS = (process.env.BOILERPLATE_KEYWORDS || '')
-  .split(',')
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+// Exclusões por tópico na query (menos agressivo; deixe vazio se quiser nenhuma)
+// Por padrão deixo vazio para evitar “zerar” a busca. Ajuste se quiser.
+const EXCLUDE_TOPICS = (process.env.EXCLUDE_TOPICS || '').trim(); // ex: '-topic:template -topic:boilerplate'
 
-// Sharding por trimestres (últimos N trimestres a partir do atual)
+// Trimestres
 const QUARTERS_COUNT = parseInt(process.env.QUARTERS_COUNT || '20', 10);
+
+// Token
+const GITHUB_TOKEN =
+  process.env.GITHUB_TOKEN || process.env.PAT || process.env.GH_TOKEN;
+
+if (!GITHUB_TOKEN) {
+  console.error('Erro: GITHUB_TOKEN não encontrado.');
+  process.exit(1);
+}
 
 // Finalização graciosa ao receber sinais (ex.: cancelamento do job)
 let stopRequested = false;
@@ -57,19 +55,8 @@ process.on('SIGINT', () => {
   stopRequested = true;
 });
 
-// Token (Actions injeta GITHUB_TOKEN automaticamente)
-const GITHUB_TOKEN =
-  process.env.GITHUB_TOKEN || process.env.PAT || process.env.GH_TOKEN;
-
-if (!GITHUB_TOKEN) {
-  console.error(
-    'Erro: GITHUB_TOKEN não encontrado. No Actions, use secrets.GITHUB_TOKEN. Local: exporte GITHUB_TOKEN.'
-  );
-  process.exit(1);
-}
-
 // =========================
-// Utilitários
+// Util
 // =========================
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -109,7 +96,6 @@ function appendCsvRow({
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
     const res = await fetch(url, {
       ...options,
@@ -121,12 +107,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
         ...(options.headers || {}),
       },
     });
-
     clearTimeout(id);
     return res;
-  } catch (err) {
+  } catch (e) {
     clearTimeout(id);
-    throw err;
+    throw e;
   }
 }
 
@@ -135,76 +120,42 @@ async function handleRateLimit(res) {
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = res.headers.get('x-ratelimit-reset');
     if (remaining === '0' && reset) {
-      const resetEpoch = parseInt(reset, 10) * 1000;
-      const waitMs = Math.max(0, resetEpoch - Date.now()) + 5000;
+      const waitMs =
+        Math.max(0, parseInt(reset, 10) * 1000 - Date.now()) + 5000;
       console.warn(
         `Rate limit atingido. Aguardando ${(waitMs / 1000).toFixed(0)}s...`
       );
       await sleep(waitMs);
-      return true; // tentar novamente
+      return true;
     }
   }
   return false;
 }
 
-async function ghGraphQL(query, variables) {
-  while (true) {
-    const res = await fetchWithTimeout('https://api.github.com/graphql', {
-      method: 'POST',
-      body: JSON.stringify({ query, variables }),
-      headers: { 'Content-Type': 'application/json' },
-    });
-
-    if (res.status === 403) {
-      const willRetry = await handleRateLimit(res);
-      if (willRetry) continue;
-    }
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new Error(
-        `GraphQL falhou: ${res.status} - ${res.statusText} - ${txt.slice(
-          0,
-          500
-        )}`
-      );
-    }
-
-    const json = await res.json();
-    if (json.errors) {
-      throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
-    }
-    return json.data;
-  }
-}
-
 async function ghGET(url) {
   while (true) {
     const res = await fetchWithTimeout(url, { method: 'GET' });
-
     if (res.status === 403) {
-      const willRetry = await handleRateLimit(res);
-      if (willRetry) continue;
+      const retry = await handleRateLimit(res);
+      if (retry) continue;
     }
-
     if (res.status === 404) return { status: 404 };
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
       throw new Error(
         `GET ${url} falhou: ${res.status} - ${res.statusText} - ${txt.slice(
           0,
-          500
+          300
         )}`
       );
     }
-
-    const json = await res.json().catch(() => null);
-    return { status: res.status, data: json };
+    const data = await res.json().catch(() => null);
+    return { status: res.status, data };
   }
 }
 
 // =========================
-/* Detecção de tecnologias e metadados */
+// Detecção tech
 // =========================
 async function getRepoLanguages(owner, repo) {
   const { status, data } = await ghGET(
@@ -241,8 +192,8 @@ async function getRepoContent(owner, repo, pathName) {
 }
 
 function hasDep(pkgJson, name) {
-  const deps = pkgJson.dependencies || {};
-  const dev = pkgJson.devDependencies || {};
+  const deps = pkgJson?.dependencies || {};
+  const dev = pkgJson?.devDependencies || {};
   return Boolean(deps[name] || dev[name]);
 }
 
@@ -251,14 +202,14 @@ function pkgHasAnyDep(pkgJson, names) {
 }
 
 function scriptsContain(pkgJson, substrings) {
-  const scripts = pkgJson.scripts || {};
+  const scripts = pkgJson?.scripts || {};
   const values = Object.values(scripts)
     .filter((s) => typeof s === 'string')
     .map((s) => s.toLowerCase());
   return substrings.some((sub) => values.some((s) => s.includes(sub)));
 }
 
-// Apenas Jest e Testing Library contam como testes de front-end
+// Apenas Jest e Testing Library contam
 function detectFrontendFromPkg(pkgJson) {
   const libs = [];
   const hasJest =
@@ -274,7 +225,7 @@ function detectFrontendFromPkg(pkgJson) {
   if (hasJest) libs.push('jest');
 
   const hasFrontendTests = hasJest || hasRTL;
-  return { hasFrontendTests, libs, hasJest, hasRTL };
+  return { hasFrontendTests, libs, hasJest };
 }
 
 async function detectTech(owner, repo) {
@@ -285,13 +236,10 @@ async function detectTech(owner, repo) {
   let feLibs = [];
   let topics = [];
 
-  // Linguagens
   const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
-  if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0) {
+  if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0)
     hasTS = true;
-  }
 
-  // package.json
   const pkgText = await getRepoContent(owner, repo, 'package.json');
   let pkgJson = null;
   if (pkgText) {
@@ -307,16 +255,13 @@ async function detectTech(owner, repo) {
     const fe = detectFrontendFromPkg(pkgJson);
     hasFrontendTests = fe.hasFrontendTests;
     feLibs = fe.libs;
-    hasJest = fe.hasJest; // pode ser confirmado por jest.config.*
+    hasJest = fe.hasJest;
   }
 
-  // Topics ajudam a confirmar React
   topics = await getRepoTopics(owner, repo).catch(() => []);
-  if (!hasReact) {
-    if (topics.map((t) => t.toLowerCase()).includes('react')) hasReact = true;
-  }
+  if (!hasReact && topics.map((t) => t.toLowerCase()).includes('react'))
+    hasReact = true;
 
-  // tsconfig.* confirma TS em alguns casos
   if (!hasTS) {
     const tsconfig = await getRepoContent(owner, repo, 'tsconfig.json');
     const tsconfigBase = tsconfig
@@ -325,7 +270,6 @@ async function detectTech(owner, repo) {
     if (tsconfig || tsconfigBase) hasTS = true;
   }
 
-  // Jest config na raiz (ajuda a marcar Jest)
   if (!hasJest) {
     const candidates = [
       'jest.config.js',
@@ -344,10 +288,7 @@ async function detectTech(owner, repo) {
     if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
   }
 
-  // Se detectou Jest por config, também conta como front-end tests (regra atual)
-  if (!hasFrontendTests && hasJest) {
-    hasFrontendTests = true;
-  }
+  if (!hasFrontendTests && hasJest) hasFrontendTests = true;
 
   return { hasTS, hasReact, hasJest, hasFrontendTests, feLibs, topics };
 }
@@ -391,6 +332,15 @@ const BOILERPLATE_KEYWORDS_DEFAULT = [
   'template',
   'templates',
 ];
+
+const EXTRA_COURSE_KEYWORDS = (process.env.COURSE_KEYWORDS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const EXTRA_BOILERPLATE_KEYWORDS = (process.env.BOILERPLATE_KEYWORDS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 function textIncludesAny(haystack, keywords) {
   const lc = (haystack || '').toLowerCase();
@@ -449,56 +399,8 @@ async function detectCourseOrBoilerplate(
 }
 
 // =========================
-// Busca GraphQL
+// Busca via REST /search/repositories com pushed por trimestre
 // =========================
-const SEARCH_REPOS = `
-query($queryString: String!, $first: Int!, $after: String) {
-  search(query: $queryString, type: REPOSITORY, first: $first, after: $after) {
-    repositoryCount
-    edges {
-      node {
-        ... on Repository {
-          name
-          description
-          owner { login }
-          stargazerCount
-        }
-      }
-    }
-    pageInfo {
-      endCursor
-      hasNextPage
-    }
-  }
-}
-`;
-
-// =========================
-// Sharding por trimestres (pushed) — sem exclusões textuais por padrão
-// =========================
-
-// Bases amplas (TS + React). A detecção de Jest/RTL fica no código.
-const BASES = [
-  'language:TypeScript react',
-  'language:TypeScript topic:react',
-  'language:TypeScript "react" in:name,description,readme',
-];
-
-// Exclusões por tópico (menos agressivas). Personalizável por env.
-const EXCLUDE_TOPICS = (
-  process.env.EXCLUDE_TOPICS ||
-  '-topic:boilerplate -topic:starter -topic:seed -topic:tutorial -topic:course -topic:template -topic:templates'
-).trim();
-
-// Termos de exclusão textuais (desativado por padrão). Ative com APPLY_TEXT_EXCLUDES=true.
-const EXCLUDE_TERMS = (
-  process.env.EXCLUDE_TERMS ||
-  '-boilerplate -starter -seed -tutorial -course -bootcamp -template -templates'
-).trim();
-const APPLY_TEXT_EXCLUDES =
-  (process.env.APPLY_TEXT_EXCLUDES || 'false').toLowerCase() === 'true';
-
-// Gera os últimos N trimestres (inclui o trimestre atual)
 function buildLastNQuarters(n) {
   const ranges = [];
   const now = new Date();
@@ -515,36 +417,42 @@ function buildLastNQuarters(n) {
       lastDay
     ).padStart(2, '0')}`;
     ranges.push(`pushed:${start}..${finish}`);
-    // volta 1 trimestre
-    cur = new Date(Date.UTC(y, m0 - 3, 1));
+    cur = new Date(Date.UTC(y, m0 - 3, 1)); // volta 1 trimestre
   }
-  return ranges; // ordem: Q_atual, Q-1, ..., Q-(n-1)
+  return ranges;
 }
+
+// Bases amplas (TS + React); Jest/RTL é validado no código
+const BASES = [
+  'language:TypeScript react',
+  'language:TypeScript topic:react',
+  'language:TypeScript "react" in:name,description,readme',
+];
 
 function buildQueries() {
   const quarters = buildLastNQuarters(QUARTERS_COUNT);
-  console.log(
-    `Shard por pushed (trimestres): ${quarters.length} (últimos ${QUARTERS_COUNT})`
-  );
   const queries = [];
-  const excl = [EXCLUDE_TOPICS, APPLY_TEXT_EXCLUDES ? EXCLUDE_TERMS : '']
-    .filter(Boolean)
-    .join(' ')
-    .trim();
-
+  const excl = EXCLUDE_TOPICS; // ex: '-topic:template -topic:boilerplate'
   for (const base of BASES) {
     for (const pushed of quarters) {
-      // Importante: sem "sort:" dentro do texto da query
       const q = [base, pushed, 'fork:false', 'archived:false', excl]
         .filter(Boolean)
-        .join(' ');
+        .join(' ')
+        .trim();
       queries.push(q);
     }
   }
   return queries;
 }
 
-const QUERY_STRINGS = buildQueries();
+async function searchReposREST(query, page, perPage) {
+  const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(
+    query
+  )}&per_page=${perPage}&page=${page}`;
+  const { status, data } = await ghGET(url);
+  if (status !== 200 || !data) return { total_count: 0, items: [] };
+  return { total_count: data.total_count || 0, items: data.items || [] };
+}
 
 // =========================
 // Main
@@ -556,46 +464,35 @@ async function main() {
   let totalQualified = 0;
   let reachedLimit = false;
 
-  console.log(
-    `Limites: MAX_QUALIFIED=${MAX_QUALIFIED} | MAX_ANALYZED=${MAX_ANALYZED}`
-  );
-  console.log(
-    `Filtros: REQUIRE_FRONTEND_TESTS=${REQUIRE_FRONTEND_TESTS} | EXCLUDE_COURSE_BOILERPLATE(templates)=${EXCLUDE_COURSE_BOILERPLATE} | README_COURSE_CHECK=${README_COURSE_CHECK}`
-  );
-  console.log(`Queries geradas: ${QUERY_STRINGS.length}`);
+  const queries = buildQueries();
+  console.log(`Queries geradas: ${queries.length}`);
+  if (queries.length > 0) console.log(`Exemplo de query[0]: ${queries[0]}`);
 
-  for (const queryString of QUERY_STRINGS) {
+  for (const q of queries) {
     if (reachedLimit || stopRequested) break;
 
-    console.log(`\n🔎 Iniciando query: "${queryString}"`);
-    let after = null;
+    console.log(`\n🔎 Query: ${q}`);
+    let page = 1;
 
     while (!reachedLimit && !stopRequested) {
-      const vars = { queryString, first: BATCH_SIZE, after };
-
-      let data;
+      let result;
       try {
-        data = await ghGraphQL(SEARCH_REPOS, vars);
-      } catch (err) {
-        console.error(`❌ Erro GraphQL: ${err.message}`);
+        result = await searchReposREST(q, page, BATCH_SIZE);
+      } catch (e) {
+        console.error(`❌ Erro na busca REST: ${e.message}`);
         break;
       }
 
-      const edges = data?.search?.edges || [];
-      const avail = data?.search?.repositoryCount ?? 'N/A';
+      const items = result.items || [];
       console.log(
-        `📈 repositoryCount≈${avail} | Página com ${edges.length} itens`
+        `📈 total_count≈${result.total_count} | página=${page} | itens=${items.length}`
       );
-      if (edges.length === 0) {
-        console.log('📄 Sem mais resultados nesta página.');
-        break;
-      }
 
-      for (const edge of edges) {
+      if (items.length === 0) break;
+
+      for (const it of items) {
         if (reachedLimit || stopRequested) break;
-
-        const repo = edge.node;
-        const nameWithOwner = `${repo.owner.login}/${repo.name}`;
+        const nameWithOwner = it.full_name; // 'owner/repo'
 
         if (processed.has(nameWithOwner)) continue;
         processed.add(nameWithOwner);
@@ -607,20 +504,19 @@ async function main() {
         }
 
         console.log(
-          `🔍 Analisando: ${nameWithOwner} (${repo.stargazerCount}⭐)`
+          `🔍 Analisando: ${nameWithOwner} (${it.stargazers_count}⭐)`
         );
 
         try {
-          const tech = await detectTech(repo.owner.login, repo.name);
+          const tech = await detectTech(it.owner.login, it.name);
           const courseFlag = await detectCourseOrBoilerplate(
-            repo.owner.login,
-            repo.name,
-            repo.name,
-            repo.description,
+            it.owner.login,
+            it.name,
+            it.name,
+            it.description,
             tech.topics
           );
 
-          // Filtros
           if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
             console.log(
               `⏭️ Excluído por curso/boilerplate/template: ${nameWithOwner}`
@@ -642,10 +538,9 @@ async function main() {
             continue;
           }
 
-          // Mantém se passou
           appendCsvRow({
             nameWithOwner,
-            stars: repo.stargazerCount,
+            stars: it.stargazers_count,
             hasTS: tech.hasTS,
             hasReact: tech.hasReact,
             hasJest: tech.hasJest,
@@ -671,17 +566,20 @@ async function main() {
 
       if (reachedLimit || stopRequested) break;
 
-      if (!data.search.pageInfo.hasNextPage) {
-        console.log('🏁 Fim da paginação para esta query.');
+      // Search API tem teto de 1000 resultados por query (10 páginas de 100)
+      const maxPages = Math.ceil(
+        Math.min(result.total_count, 1000) / BATCH_SIZE
+      );
+      if (page >= maxPages) {
+        console.log('🏁 Fim da paginação desta query (limite da Search API).');
         break;
       }
-      after = data.search.pageInfo.endCursor;
-
+      page += 1;
       await sleep(SLEEP_BETWEEN_PAGES_MS);
     }
 
-    console.log(`📊 Query finalizada: "${queryString}"`);
-    await sleep(1000);
+    console.log('📊 Query finalizada.');
+    await sleep(600);
   }
 
   console.log('\n🎉 ===== RESUMO =====');
