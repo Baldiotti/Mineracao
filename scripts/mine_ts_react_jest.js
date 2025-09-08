@@ -19,8 +19,8 @@ const SLEEP_BETWEEN_PAGES_MS = parseInt(
 );
 
 // Limites globais
-const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '1000', 10);
-const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '0', 10); // 0 = ilimitado
+const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '10000', 10);
+const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '10000', 10); // 0 = ilimitado
 
 // Filtros
 const REQUIRE_FRONTEND_TESTS =
