@@ -71,7 +71,7 @@ function writeCsvHeaderIfNeeded() {
   if (!fs.existsSync(CSV_FILE)) {
     fs.writeFileSync(
       CSV_FILE,
-      'Repositorio,Link,Estrelas,TypeScript,React,Jest,FrontendTestLibs\n',
+      'Repositorio,Link,Estrelas,TypeScript,React,Jest,FrontendTestLibs,ReactDeps,TestLibsDetected\n',
       'utf-8'
     );
   }
@@ -84,12 +84,16 @@ function appendCsvRow({
   hasReact,
   hasJest,
   feLibs,
+  hasReactDeps,
+  hasFrontendTestLibs,
 }) {
   const libs = (feLibs || []).join('|');
   const link = `https://github.com/${nameWithOwner}`;
   const line = `${nameWithOwner},${link},${stars},${hasTS ? 'Sim' : 'Não'},${
     hasReact ? 'Sim' : 'Não'
-  },${hasJest ? 'Sim' : 'Não'},${libs}\n`;
+  },${hasJest ? 'Sim' : 'Não'},${libs},${hasReactDeps ? 'Sim' : 'Não'},${
+    hasFrontendTestLibs ? 'Sim' : 'Não'
+  }\n`;
   fs.appendFileSync(CSV_FILE, line);
 }
 
@@ -191,6 +195,102 @@ async function getRepoContent(owner, repo, pathName) {
   return null;
 }
 
+async function searchForTestFiles(owner, repo) {
+  // Busca por arquivos de teste React específicos
+  const testPatterns = ['src', '__tests__', 'test', 'tests'];
+
+  let foundReactTests = false;
+
+  for (const pattern of testPatterns) {
+    if (foundReactTests) break;
+
+    try {
+      const { status, data } = await ghGET(
+        `https://api.github.com/repos/${owner}/${repo}/contents/${pattern}`
+      );
+
+      if (status === 200 && Array.isArray(data)) {
+        foundReactTests = await searchDirectoryForReactTests(
+          owner,
+          repo,
+          data,
+          pattern
+        );
+      }
+    } catch (err) {
+      // Diretório não existe, continua
+      continue;
+    }
+  }
+
+  return foundReactTests;
+}
+
+async function searchDirectoryForReactTests(
+  owner,
+  repo,
+  contents,
+  basePath = ''
+) {
+  for (const item of contents) {
+    if (item.type === 'file') {
+      // Verifica se é arquivo de teste TSX
+      if (item.name.match(/\.(test|spec)\.tsx?$/)) {
+        try {
+          const content = await getRepoContent(owner, repo, item.path);
+          if (content) {
+            // Verifica se contém imports específicos de teste React
+            const hasRenderImport =
+              content.includes('import { render }') &&
+              content.includes('@testing-library/react');
+            const hasEnzymeImport =
+              content.includes('enzyme') ||
+              content.includes('shallow') ||
+              content.includes('mount');
+
+            if (hasRenderImport || hasEnzymeImport) {
+              console.log(`✅ Encontrado arquivo de teste React: ${item.path}`);
+              return true;
+            }
+          }
+        } catch (err) {
+          // Falha ao ler arquivo, continua
+          continue;
+        }
+      }
+    } else if (
+      item.type === 'dir' &&
+      item.name !== 'node_modules' &&
+      item.name !== '.git'
+    ) {
+      // Busca recursiva limitada a 2 níveis para evitar timeout
+      const depth = basePath.split('/').length;
+      if (depth < 3) {
+        try {
+          const { status, data } = await ghGET(
+            `https://api.github.com/repos/${owner}/${repo}/contents/${item.path}`
+          );
+
+          if (status === 200 && Array.isArray(data)) {
+            const found = await searchDirectoryForReactTests(
+              owner,
+              repo,
+              data,
+              item.path
+            );
+            if (found) return true;
+          }
+        } catch (err) {
+          // Falha ao acessar diretório, continua
+          continue;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
 function hasDep(pkgJson, name) {
   const deps = pkgJson?.dependencies || {};
   const dev = pkgJson?.devDependencies || {};
@@ -209,23 +309,41 @@ function scriptsContain(pkgJson, substrings) {
   return substrings.some((sub) => values.some((s) => s.includes(sub)));
 }
 
-// Apenas Jest e Testing Library contam
+// Verificações específicas para testes de frontend
 function detectFrontendFromPkg(pkgJson) {
   const libs = [];
+
+  // Verificação obrigatória: Jest deve estar presente
   const hasJest =
     pkgHasAnyDep(pkgJson, ['jest', '@jest/globals', 'ts-jest', 'babel-jest']) ||
     scriptsContain(pkgJson, ['jest']);
+
+  // Verificação obrigatória: React deve estar presente
+  const hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
+
+  // Verificação de bibliotecas específicas de teste de frontend
   const hasRTL = pkgHasAnyDep(pkgJson, [
     '@testing-library/react',
     '@testing-library/jest-dom',
     '@testing-library/user-event',
   ]);
+  const hasEnzyme = pkgHasAnyDep(pkgJson, ['enzyme']);
 
   if (hasRTL) libs.push('testing-library');
+  if (hasEnzyme) libs.push('enzyme');
   if (hasJest) libs.push('jest');
 
-  const hasFrontendTests = hasJest || hasRTL;
-  return { hasFrontendTests, libs, hasJest };
+  // Frontend tests só são válidos se tiver React + Jest + pelo menos uma lib de teste
+  const hasFrontendTestLibs = hasRTL || hasEnzyme;
+  const hasFrontendTests = hasReactDeps && hasJest && hasFrontendTestLibs;
+
+  return {
+    hasFrontendTests,
+    libs,
+    hasJest,
+    hasReactDeps,
+    hasFrontendTestLibs,
+  };
 }
 
 async function detectTech(owner, repo) {
@@ -235,6 +353,8 @@ async function detectTech(owner, repo) {
   let hasFrontendTests = false;
   let feLibs = [];
   let topics = [];
+  let hasReactDeps = false;
+  let hasFrontendTestLibs = false;
 
   const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
   if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0)
@@ -249,13 +369,21 @@ async function detectTech(owner, repo) {
   }
 
   if (pkgJson) {
-    if (pkgHasAnyDep(pkgJson, ['react', 'react-dom'])) hasReact = true;
+    // Verificação específica para React nas dependencies
+    hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
+    hasReact = hasReactDeps;
+
     if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
 
     const fe = detectFrontendFromPkg(pkgJson);
     hasFrontendTests = fe.hasFrontendTests;
     feLibs = fe.libs;
     hasJest = fe.hasJest;
+    hasFrontendTestLibs = fe.hasFrontendTestLibs;
+
+    console.log(
+      `📦 Package.json - React: ${hasReactDeps}, Jest: ${hasJest}, Frontend Test Libs: ${hasFrontendTestLibs}`
+    );
   }
 
   topics = await getRepoTopics(owner, repo).catch(() => []);
@@ -288,9 +416,34 @@ async function detectTech(owner, repo) {
     if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
   }
 
-  if (!hasFrontendTests && hasJest) hasFrontendTests = true;
+  // Se não encontrou libs de teste no package.json, busca por arquivos de teste
+  if (hasReact && hasJest && !hasFrontendTestLibs) {
+    console.log(`🔍 Buscando arquivos de teste React na estrutura...`);
+    try {
+      const foundTestFiles = await searchForTestFiles(owner, repo);
+      if (foundTestFiles) {
+        hasFrontendTestLibs = true;
+        feLibs.push('test-files');
+        console.log(`✅ Encontrados arquivos de teste React válidos`);
+      }
+    } catch (err) {
+      console.log(`⚠️ Erro ao buscar arquivos de teste: ${err.message}`);
+    }
+  }
 
-  return { hasTS, hasReact, hasJest, hasFrontendTests, feLibs, topics };
+  // Regra final: só é válido se tiver React + Jest + evidência de testes de frontend
+  hasFrontendTests = hasReact && hasJest && hasFrontendTestLibs;
+
+  return {
+    hasTS,
+    hasReact,
+    hasJest,
+    hasFrontendTests,
+    feLibs,
+    topics,
+    hasReactDeps,
+    hasFrontendTestLibs,
+  };
 }
 
 // =========================
@@ -531,9 +684,10 @@ async function main() {
             continue;
           }
 
-          if (REQUIRE_FRONTEND_TESTS && !tech.hasFrontendTests) {
+          // Nova validação: deve ter React + Jest + evidência de testes de frontend
+          if (!tech.hasFrontendTests) {
             console.log(
-              `❌ Sem testes de front-end (Jest/Testing Library) detectados: ${nameWithOwner}`
+              `❌ Não atende critérios de testes frontend (React:${tech.hasReact} Jest:${tech.hasJest} FrontendTestLibs:${tech.hasFrontendTestLibs}): ${nameWithOwner}`
             );
             continue;
           }
@@ -545,6 +699,8 @@ async function main() {
             hasReact: tech.hasReact,
             hasJest: tech.hasJest,
             feLibs: tech.feLibs,
+            hasReactDeps: tech.hasReactDeps,
+            hasFrontendTestLibs: tech.hasFrontendTestLibs,
           });
 
           totalQualified++;
