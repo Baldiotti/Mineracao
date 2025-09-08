@@ -5,24 +5,20 @@
 
 const fs = require('fs');
 const path = require('path');
+const pLimit = require('p-limit');
 
-// =========================
-// Config
-// =========================
 const OUTPUT_DIR = 'output';
 const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
 
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100', 10); // por página (REST: per_page máx 100)
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '100', 10);
 const SLEEP_BETWEEN_PAGES_MS = parseInt(
   process.env.SLEEP_BETWEEN_PAGES_MS || '800',
   10
 );
 
-// Limites globais
 const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '10000', 10);
-const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '10000', 10); // 0 = ilimitado
+const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '10000', 10);
 
-// Filtros
 const REQUIRE_FRONTEND_TESTS =
   (process.env.REQUIRE_FRONTEND_TESTS || 'true').toLowerCase() === 'true';
 const EXCLUDE_COURSE_BOILERPLATE =
@@ -30,14 +26,16 @@ const EXCLUDE_COURSE_BOILERPLATE =
 const README_COURSE_CHECK =
   (process.env.README_COURSE_CHECK || 'false').toLowerCase() === 'true';
 
-// Exclusões por tópico na query (menos agressivo; deixe vazio se quiser nenhuma)
-// Por padrão deixo vazio para evitar “zerar” a busca. Ajuste se quiser.
-const EXCLUDE_TOPICS = (process.env.EXCLUDE_TOPICS || '').trim(); // ex: '-topic:template -topic:boilerplate'
+const EXCLUDE_TOPICS = (process.env.EXCLUDE_TOPICS || '').trim();
 
-// Trimestres
 const QUARTERS_COUNT = parseInt(process.env.QUARTERS_COUNT || '20', 10);
 
+// Concorrência
+const CONCURRENT_REPOS = parseInt(process.env.CONCURRENT_REPOS || '5', 10);
+const limit = pLimit(CONCURRENT_REPOS);
+
 // Token
+
 const GITHUB_TOKEN =
   process.env.GITHUB_TOKEN || process.env.PAT || process.env.GH_TOKEN;
 
@@ -46,7 +44,6 @@ if (!GITHUB_TOKEN) {
   process.exit(1);
 }
 
-// Finalização graciosa ao receber sinais (ex.: cancelamento do job)
 let stopRequested = false;
 process.on('SIGTERM', () => {
   stopRequested = true;
@@ -55,9 +52,6 @@ process.on('SIGINT', () => {
   stopRequested = true;
 });
 
-// =========================
-// Util
-// =========================
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -136,6 +130,36 @@ async function handleRateLimit(res) {
   return false;
 }
 
+async function checkDynamicRateLimit(res) {
+  const remaining = parseInt(
+    res.headers.get('x-ratelimit-remaining') || '5000',
+    10
+  );
+  const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10);
+
+  if (remaining < 1000 && reset > 0) {
+    const resetTime = reset * 1000;
+    const now = Date.now();
+    const timeToReset = Math.max(0, resetTime - now);
+
+    // Calcula sleep proporcional baseado no remaining
+    const proportionalWait = Math.min(
+      timeToReset / Math.max(remaining, 1),
+      5000
+    );
+
+    if (proportionalWait > 100) {
+      // Só pausa se for significativo
+      console.log(
+        `⏳ Rate limit baixo (${remaining} restantes). Pausando ${(
+          proportionalWait / 1000
+        ).toFixed(1)}s...`
+      );
+      await sleep(proportionalWait);
+    }
+  }
+}
+
 async function ghGET(url) {
   while (true) {
     const res = await fetchWithTimeout(url, { method: 'GET' });
@@ -154,13 +178,124 @@ async function ghGET(url) {
       );
     }
     const data = await res.json().catch(() => null);
+
+    // Controle dinâmico de rate limit
+    await checkDynamicRateLimit(res);
+
     return { status: res.status, data };
   }
 }
 
-// =========================
-// Detecção tech
-// =========================
+async function ghGraphQL(query, variables = {}) {
+  while (true) {
+    const res = await fetchWithTimeout('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+
+    if (res.status === 403) {
+      const retry = await handleRateLimit(res);
+      if (retry) continue;
+    }
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(
+        `GraphQL falhou: ${res.status} - ${res.statusText} - ${txt.slice(
+          0,
+          300
+        )}`
+      );
+    }
+
+    const data = await res.json().catch(() => null);
+
+    // Controle dinâmico de rate limit
+    await checkDynamicRateLimit(res);
+
+    if (data?.errors) {
+      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
+    }
+
+    return data?.data || null;
+  }
+}
+
+async function getRepoInfoGraphQL(owner, repo) {
+  const query = `
+    query GetRepoInfo($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        languages(first: 20) {
+          edges {
+            size
+            node {
+              name
+            }
+          }
+        }
+        repositoryTopics(first: 20) {
+          nodes {
+            topic {
+              name
+            }
+          }
+        }
+        packageJson: object(expression: "HEAD:package.json") {
+          ... on Blob {
+            text
+          }
+        }
+        tsconfig: object(expression: "HEAD:tsconfig.json") {
+          ... on Blob {
+            text
+          }
+        }
+        tsconfigBase: object(expression: "HEAD:tsconfig.base.json") {
+          ... on Blob {
+            text
+          }
+        }
+        jestConfigJs: object(expression: "HEAD:jest.config.js") {
+          ... on Blob {
+            text
+          }
+        }
+        jestConfigCjs: object(expression: "HEAD:jest.config.cjs") {
+          ... on Blob {
+            text
+          }
+        }
+        jestConfigMjs: object(expression: "HEAD:jest.config.mjs") {
+          ... on Blob {
+            text
+          }
+        }
+        jestConfigTs: object(expression: "HEAD:jest.config.ts") {
+          ... on Blob {
+            text
+          }
+        }
+        jestConfigJson: object(expression: "HEAD:jest.config.json") {
+          ... on Blob {
+            text
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const data = await ghGraphQL(query, { owner, name: repo });
+    return data?.repository || null;
+  } catch (err) {
+    console.warn(`⚠️ GraphQL falhou para ${owner}/${repo}: ${err.message}`);
+    return null;
+  }
+}
+
 async function getRepoLanguages(owner, repo) {
   const { status, data } = await ghGET(
     `https://api.github.com/repos/${owner}/${repo}/languages`
@@ -196,7 +331,6 @@ async function getRepoContent(owner, repo, pathName) {
 }
 
 async function searchForTestFiles(owner, repo) {
-  // Busca por arquivos de teste React específicos
   const testPatterns = ['src', '__tests__', 'test', 'tests'];
 
   let foundReactTests = false;
@@ -218,7 +352,6 @@ async function searchForTestFiles(owner, repo) {
         );
       }
     } catch (err) {
-      // Diretório não existe, continua
       continue;
     }
   }
@@ -234,12 +367,10 @@ async function searchDirectoryForReactTests(
 ) {
   for (const item of contents) {
     if (item.type === 'file') {
-      // Verifica se é arquivo de teste TSX
       if (item.name.match(/\.(test|spec)\.tsx?$/)) {
         try {
           const content = await getRepoContent(owner, repo, item.path);
           if (content) {
-            // Verifica se contém imports específicos de teste React
             const hasRenderImport =
               content.includes('import { render }') &&
               content.includes('@testing-library/react');
@@ -254,7 +385,6 @@ async function searchDirectoryForReactTests(
             }
           }
         } catch (err) {
-          // Falha ao ler arquivo, continua
           continue;
         }
       }
@@ -263,7 +393,6 @@ async function searchDirectoryForReactTests(
       item.name !== 'node_modules' &&
       item.name !== '.git'
     ) {
-      // Busca recursiva limitada a 2 níveis para evitar timeout
       const depth = basePath.split('/').length;
       if (depth < 3) {
         try {
@@ -281,7 +410,6 @@ async function searchDirectoryForReactTests(
             if (found) return true;
           }
         } catch (err) {
-          // Falha ao acessar diretório, continua
           continue;
         }
       }
@@ -309,19 +437,15 @@ function scriptsContain(pkgJson, substrings) {
   return substrings.some((sub) => values.some((s) => s.includes(sub)));
 }
 
-// Verificações específicas para testes de frontend
 function detectFrontendFromPkg(pkgJson) {
   const libs = [];
 
-  // Verificação obrigatória: Jest deve estar presente
   const hasJest =
     pkgHasAnyDep(pkgJson, ['jest', '@jest/globals', 'ts-jest', 'babel-jest']) ||
     scriptsContain(pkgJson, ['jest']);
 
-  // Verificação obrigatória: React deve estar presente
   const hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
 
-  // Verificação de bibliotecas específicas de teste de frontend
   const hasRTL = pkgHasAnyDep(pkgJson, [
     '@testing-library/react',
     '@testing-library/jest-dom',
@@ -333,7 +457,6 @@ function detectFrontendFromPkg(pkgJson) {
   if (hasEnzyme) libs.push('enzyme');
   if (hasJest) libs.push('jest');
 
-  // Frontend tests só são válidos se tiver React + Jest + pelo menos uma lib de teste
   const hasFrontendTestLibs = hasRTL || hasEnzyme;
   const hasFrontendTests = hasReactDeps && hasJest && hasFrontendTestLibs;
 
@@ -356,64 +479,144 @@ async function detectTech(owner, repo) {
   let hasReactDeps = false;
   let hasFrontendTestLibs = false;
 
-  const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
-  if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0)
-    hasTS = true;
+  // Busca informações via GraphQL primeiro
+  const repoInfo = await getRepoInfoGraphQL(owner, repo);
 
-  const pkgText = await getRepoContent(owner, repo, 'package.json');
-  let pkgJson = null;
-  if (pkgText) {
-    try {
-      pkgJson = JSON.parse(pkgText);
-    } catch {}
-  }
+  if (repoInfo) {
+    // Processa linguagens
+    const languages = {};
+    if (repoInfo.languages?.edges) {
+      repoInfo.languages.edges.forEach((edge) => {
+        languages[edge.node.name] = edge.size;
+      });
+    }
 
-  if (pkgJson) {
-    // Verificação específica para React nas dependencies
-    hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
-    hasReact = hasReactDeps;
+    if (languages.TypeScript && languages.TypeScript > 0) {
+      hasTS = true;
+    }
 
-    if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
+    // Processa tópicos
+    if (repoInfo.repositoryTopics?.nodes) {
+      topics = repoInfo.repositoryTopics.nodes.map((node) => node.topic.name);
+    }
 
-    const fe = detectFrontendFromPkg(pkgJson);
-    hasFrontendTests = fe.hasFrontendTests;
-    feLibs = fe.libs;
-    hasJest = fe.hasJest;
-    hasFrontendTestLibs = fe.hasFrontendTestLibs;
-
-    console.log(
-      `📦 Package.json - React: ${hasReactDeps}, Jest: ${hasJest}, Frontend Test Libs: ${hasFrontendTestLibs}`
-    );
-  }
-
-  topics = await getRepoTopics(owner, repo).catch(() => []);
-  if (!hasReact && topics.map((t) => t.toLowerCase()).includes('react'))
-    hasReact = true;
-
-  if (!hasTS) {
-    const tsconfig = await getRepoContent(owner, repo, 'tsconfig.json');
-    const tsconfigBase = tsconfig
-      ? null
-      : await getRepoContent(owner, repo, 'tsconfig.base.json');
-    if (tsconfig || tsconfigBase) hasTS = true;
-  }
-
-  if (!hasJest) {
-    const candidates = [
-      'jest.config.js',
-      'jest.config.cjs',
-      'jest.config.mjs',
-      'jest.config.ts',
-      'jest.config.json',
-    ];
-    for (const file of candidates) {
-      const content = await getRepoContent(owner, repo, file);
-      if (content) {
-        hasJest = true;
-        break;
+    // Processa package.json
+    let pkgJson = null;
+    if (repoInfo.packageJson?.text) {
+      try {
+        pkgJson = JSON.parse(repoInfo.packageJson.text);
+      } catch (err) {
+        console.warn(`⚠️ Erro ao parsear package.json de ${owner}/${repo}`);
       }
     }
-    if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
+
+    if (pkgJson) {
+      hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
+      hasReact = hasReactDeps;
+
+      if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
+
+      const fe = detectFrontendFromPkg(pkgJson);
+      hasFrontendTests = fe.hasFrontendTests;
+      feLibs = fe.libs;
+      hasJest = fe.hasJest;
+      hasFrontendTestLibs = fe.hasFrontendTestLibs;
+
+      console.log(
+        `📦 Package.json - React: ${hasReactDeps}, Jest: ${hasJest}, Frontend Test Libs: ${hasFrontendTestLibs}`
+      );
+    }
+
+    // Verifica React nos tópicos se não encontrou nas deps
+    if (!hasReact && topics.map((t) => t.toLowerCase()).includes('react'))
+      hasReact = true;
+
+    // Verifica TypeScript nos arquivos de config
+    if (!hasTS) {
+      const hasTsConfig = !!(
+        repoInfo.tsconfig?.text || repoInfo.tsconfigBase?.text
+      );
+      if (hasTsConfig) hasTS = true;
+    }
+
+    // Verifica Jest nos arquivos de config
+    if (!hasJest) {
+      const jestConfigs = [
+        repoInfo.jestConfigJs?.text,
+        repoInfo.jestConfigCjs?.text,
+        repoInfo.jestConfigMjs?.text,
+        repoInfo.jestConfigTs?.text,
+        repoInfo.jestConfigJson?.text,
+      ];
+
+      const hasJestConfig = jestConfigs.some((config) => !!config);
+      if (hasJestConfig) {
+        hasJest = true;
+        if (!feLibs.includes('jest')) feLibs.push('jest');
+      }
+    }
+  } else {
+    // Fallback para REST API se GraphQL falhar
+    console.log(`🔄 Fallback para REST API: ${owner}/${repo}`);
+
+    const langs = await getRepoLanguages(owner, repo).catch(() => ({}));
+    if (langs && typeof langs.TypeScript === 'number' && langs.TypeScript > 0)
+      hasTS = true;
+
+    const pkgText = await getRepoContent(owner, repo, 'package.json');
+    let pkgJson = null;
+    if (pkgText) {
+      try {
+        pkgJson = JSON.parse(pkgText);
+      } catch {}
+    }
+
+    if (pkgJson) {
+      hasReactDeps = pkgHasAnyDep(pkgJson, ['react', 'react-dom']);
+      hasReact = hasReactDeps;
+
+      if (!hasTS && pkgHasAnyDep(pkgJson, ['typescript'])) hasTS = true;
+
+      const fe = detectFrontendFromPkg(pkgJson);
+      hasFrontendTests = fe.hasFrontendTests;
+      feLibs = fe.libs;
+      hasJest = fe.hasJest;
+      hasFrontendTestLibs = fe.hasFrontendTestLibs;
+
+      console.log(
+        `📦 Package.json - React: ${hasReactDeps}, Jest: ${hasJest}, Frontend Test Libs: ${hasFrontendTestLibs}`
+      );
+    }
+
+    topics = await getRepoTopics(owner, repo).catch(() => []);
+    if (!hasReact && topics.map((t) => t.toLowerCase()).includes('react'))
+      hasReact = true;
+
+    if (!hasTS) {
+      const tsconfig = await getRepoContent(owner, repo, 'tsconfig.json');
+      const tsconfigBase = tsconfig
+        ? null
+        : await getRepoContent(owner, repo, 'tsconfig.base.json');
+      if (tsconfig || tsconfigBase) hasTS = true;
+    }
+
+    if (!hasJest) {
+      const candidates = [
+        'jest.config.js',
+        'jest.config.cjs',
+        'jest.config.mjs',
+        'jest.config.ts',
+        'jest.config.json',
+      ];
+      for (const file of candidates) {
+        const content = await getRepoContent(owner, repo, file);
+        if (content) {
+          hasJest = true;
+          break;
+        }
+      }
+      if (hasJest && !feLibs.includes('jest')) feLibs.push('jest');
+    }
   }
 
   // Se não encontrou libs de teste no package.json, busca por arquivos de teste
@@ -446,9 +649,6 @@ async function detectTech(owner, repo) {
   };
 }
 
-// =========================
-// Curso/Boilerplate/Template
-// =========================
 const COURSE_KEYWORDS_DEFAULT = [
   'curso',
   'course',
@@ -551,31 +751,27 @@ async function detectCourseOrBoilerplate(
   return { isCourseOrBoilerplate: isCourse || isBoilerOrTemplate };
 }
 
-// =========================
-// Busca via REST /search/repositories com pushed por trimestre
-// =========================
 function buildLastNQuarters(n) {
   const ranges = [];
   const now = new Date();
-  const qStartMonth = Math.floor(now.getUTCMonth() / 3) * 3; // 0,3,6,9
+  const qStartMonth = Math.floor(now.getUTCMonth() / 3) * 3;
   let cur = new Date(Date.UTC(now.getUTCFullYear(), qStartMonth, 1));
 
   for (let i = 0; i < n; i++) {
     const y = cur.getUTCFullYear();
-    const m0 = cur.getUTCMonth(); // 0,3,6,9
-    const qEndMonth = m0 + 2; // 2,5,8,11
+    const m0 = cur.getUTCMonth();
+    const qEndMonth = m0 + 2;
     const lastDay = new Date(Date.UTC(y, qEndMonth + 1, 0)).getUTCDate();
     const start = `${y}-${String(m0 + 1).padStart(2, '0')}-01`;
     const finish = `${y}-${String(qEndMonth + 1).padStart(2, '0')}-${String(
       lastDay
     ).padStart(2, '0')}`;
     ranges.push(`pushed:${start}..${finish}`);
-    cur = new Date(Date.UTC(y, m0 - 3, 1)); // volta 1 trimestre
+    cur = new Date(Date.UTC(y, m0 - 3, 1));
   }
   return ranges;
 }
 
-// Bases amplas (TS + React); Jest/RTL é validado no código
 const BASES = [
   'language:TypeScript react',
   'language:TypeScript topic:react',
@@ -585,7 +781,7 @@ const BASES = [
 function buildQueries() {
   const quarters = buildLastNQuarters(QUARTERS_COUNT);
   const queries = [];
-  const excl = EXCLUDE_TOPICS; // ex: '-topic:template -topic:boilerplate'
+  const excl = EXCLUDE_TOPICS;
   for (const base of BASES) {
     for (const pushed of quarters) {
       const q = [base, pushed, 'fork:false', 'archived:false', excl]
@@ -607,9 +803,64 @@ async function searchReposREST(query, page, perPage) {
   return { total_count: data.total_count || 0, items: data.items || [] };
 }
 
-// =========================
-// Main
-// =========================
+async function processRepository(item, processed) {
+  const nameWithOwner = item.full_name;
+
+  if (processed.has(nameWithOwner)) return null;
+  processed.add(nameWithOwner);
+
+  console.log(`🔍 Analisando: ${nameWithOwner} (${item.stargazers_count}⭐)`);
+
+  try {
+    const tech = await detectTech(item.owner.login, item.name);
+    const courseFlag = await detectCourseOrBoilerplate(
+      item.owner.login,
+      item.name,
+      item.name,
+      item.description,
+      tech.topics
+    );
+
+    if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
+      console.log(
+        `⏭️ Excluído por curso/boilerplate/template: ${nameWithOwner}`
+      );
+      return null;
+    }
+
+    if (!(tech.hasTS && tech.hasReact)) {
+      console.log(
+        `❌ Falta TS ou React (TS:${tech.hasTS} React:${tech.hasReact}): ${nameWithOwner}`
+      );
+      return null;
+    }
+
+    if (!tech.hasFrontendTests) {
+      console.log(
+        `❌ Não atende critérios de testes frontend (React:${tech.hasReact} Jest:${tech.hasJest} FrontendTestLibs:${tech.hasFrontendTestLibs}): ${nameWithOwner}`
+      );
+      return null;
+    }
+
+    const repoData = {
+      nameWithOwner,
+      stars: item.stargazers_count,
+      hasTS: tech.hasTS,
+      hasReact: tech.hasReact,
+      hasJest: tech.hasJest,
+      feLibs: tech.feLibs,
+      hasReactDeps: tech.hasReactDeps,
+      hasFrontendTestLibs: tech.hasFrontendTestLibs,
+    };
+
+    console.log(`✅ Validado: ${nameWithOwner}`);
+    return repoData;
+  } catch (err) {
+    console.warn(`⚠️ Falha ao analisar ${nameWithOwner}: ${err.message}`);
+    return null;
+  }
+}
+
 async function main() {
   writeCsvHeaderIfNeeded();
 
@@ -619,6 +870,9 @@ async function main() {
 
   const queries = buildQueries();
   console.log(`Queries geradas: ${queries.length}`);
+  console.log(
+    `Concorrência configurada: ${CONCURRENT_REPOS} repositórios em paralelo`
+  );
   if (queries.length > 0) console.log(`Exemplo de query[0]: ${queries[0]}`);
 
   for (const q of queries) {
@@ -643,69 +897,27 @@ async function main() {
 
       if (items.length === 0) break;
 
-      for (const it of items) {
-        if (reachedLimit || stopRequested) break;
-        const nameWithOwner = it.full_name; // 'owner/repo'
+      // Processa repositórios em paralelo
+      console.log(
+        `🔄 Processando ${items.length} repositórios em paralelo (máx ${CONCURRENT_REPOS})...`
+      );
+      const tasks = items.map((item) =>
+        limit(() => processRepository(item, processed))
+      );
 
-        if (processed.has(nameWithOwner)) continue;
-        processed.add(nameWithOwner);
+      const results = await Promise.all(tasks);
+      const validResults = results.filter((r) => r !== null);
+      console.log(
+        `📊 Lote processado: ${validResults.length}/${items.length} repositórios válidos`
+      );
 
-        if (MAX_ANALYZED > 0 && processed.size >= MAX_ANALYZED) {
-          console.log(`Atingiu MAX_ANALYZED=${MAX_ANALYZED}. Finalizando...`);
-          reachedLimit = true;
-          break;
-        }
-
-        console.log(
-          `🔍 Analisando: ${nameWithOwner} (${it.stargazers_count}⭐)`
-        );
-
-        try {
-          const tech = await detectTech(it.owner.login, it.name);
-          const courseFlag = await detectCourseOrBoilerplate(
-            it.owner.login,
-            it.name,
-            it.name,
-            it.description,
-            tech.topics
-          );
-
-          if (EXCLUDE_COURSE_BOILERPLATE && courseFlag.isCourseOrBoilerplate) {
-            console.log(
-              `⏭️ Excluído por curso/boilerplate/template: ${nameWithOwner}`
-            );
-            continue;
-          }
-
-          if (!(tech.hasTS && tech.hasReact)) {
-            console.log(
-              `❌ Falta TS ou React (TS:${tech.hasTS} React:${tech.hasReact}): ${nameWithOwner}`
-            );
-            continue;
-          }
-
-          // Nova validação: deve ter React + Jest + evidência de testes de frontend
-          if (!tech.hasFrontendTests) {
-            console.log(
-              `❌ Não atende critérios de testes frontend (React:${tech.hasReact} Jest:${tech.hasJest} FrontendTestLibs:${tech.hasFrontendTestLibs}): ${nameWithOwner}`
-            );
-            continue;
-          }
-
-          appendCsvRow({
-            nameWithOwner,
-            stars: it.stargazers_count,
-            hasTS: tech.hasTS,
-            hasReact: tech.hasReact,
-            hasJest: tech.hasJest,
-            feLibs: tech.feLibs,
-            hasReactDeps: tech.hasReactDeps,
-            hasFrontendTestLibs: tech.hasFrontendTestLibs,
-          });
-
+      // Escreve resultados válidos no CSV
+      for (const result of validResults) {
+        if (result && !reachedLimit && !stopRequested) {
+          appendCsvRow(result);
           totalQualified++;
           console.log(
-            `✅ Registrado: ${nameWithOwner} | Total qualificados: ${totalQualified}`
+            `📝 Registrado: ${result.nameWithOwner} | Total qualificados: ${totalQualified}`
           );
 
           if (totalQualified >= MAX_QUALIFIED) {
@@ -715,14 +927,20 @@ async function main() {
             reachedLimit = true;
             break;
           }
-        } catch (err) {
-          console.warn(`⚠️ Falha ao analisar ${nameWithOwner}: ${err.message}`);
         }
       }
 
       if (reachedLimit || stopRequested) break;
 
-      // Search API tem teto de 1000 resultados por query (10 páginas de 100)
+      // Verifica limite de repositórios analisados
+      if (MAX_ANALYZED > 0 && processed.size >= MAX_ANALYZED) {
+        console.log(`Atingiu MAX_ANALYZED=${MAX_ANALYZED}. Finalizando...`);
+        reachedLimit = true;
+        break;
+      }
+
+      if (reachedLimit || stopRequested) break;
+
       const maxPages = Math.ceil(
         Math.min(result.total_count, 1000) / BATCH_SIZE
       );
@@ -731,11 +949,11 @@ async function main() {
         break;
       }
       page += 1;
-      await sleep(SLEEP_BETWEEN_PAGES_MS);
+      // Sleep dinâmico já está sendo controlado em ghGET/ghGraphQL
     }
 
     console.log('📊 Query finalizada.');
-    await sleep(600);
+    // Removido sleep fixo - controle dinâmico está ativo
   }
 
   console.log('\n🎉 ===== RESUMO =====');
