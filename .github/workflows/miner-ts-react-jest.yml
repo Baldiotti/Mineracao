@@ -2,8 +2,6 @@ name: Minerar repositórios TS+React+Jest
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */12 * * *' # a cada 12 horas
 
 concurrency:
   group: ts-react-jest-miner
