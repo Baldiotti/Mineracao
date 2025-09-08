@@ -5,7 +5,43 @@
 
 const fs = require('fs');
 const path = require('path');
-const pLimit = require('p-limit');
+
+// Implementação nativa de controle de concorrência (substitui p-limit)
+class ConcurrencyLimiter {
+  constructor(limit) {
+    this.limit = limit;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  async add(fn) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        fn,
+        resolve,
+        reject,
+      });
+      this.tryNext();
+    });
+  }
+
+  tryNext() {
+    if (this.running >= this.limit || this.queue.length === 0) {
+      return;
+    }
+
+    this.running++;
+    const { fn, resolve, reject } = this.queue.shift();
+
+    fn()
+      .then(resolve)
+      .catch(reject)
+      .finally(() => {
+        this.running--;
+        this.tryNext();
+      });
+  }
+}
 
 const OUTPUT_DIR = 'output';
 const CSV_FILE = path.join(OUTPUT_DIR, 'repos_ts_react_jest.csv');
@@ -32,7 +68,7 @@ const QUARTERS_COUNT = parseInt(process.env.QUARTERS_COUNT || '20', 10);
 
 // Concorrência
 const CONCURRENT_REPOS = parseInt(process.env.CONCURRENT_REPOS || '5', 10);
-const limit = pLimit(CONCURRENT_REPOS);
+const limiter = new ConcurrencyLimiter(CONCURRENT_REPOS);
 
 // Token
 
@@ -902,7 +938,7 @@ async function main() {
         `🔄 Processando ${items.length} repositórios em paralelo (máx ${CONCURRENT_REPOS})...`
       );
       const tasks = items.map((item) =>
-        limit(() => processRepository(item, processed))
+        limiter.add(() => processRepository(item, processed))
       );
 
       const results = await Promise.all(tasks);
