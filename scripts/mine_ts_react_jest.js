@@ -52,7 +52,8 @@ const SLEEP_BETWEEN_PAGES_MS = parseInt(
   10
 );
 
-const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '10000', 10);
+//const MAX_QUALIFIED = parseInt(process.env.MAX_QUALIFIED || '10000', 10);
+const MAX_QUALIFIED = parseInt('10000', 10);
 const MAX_ANALYZED = parseInt(process.env.MAX_ANALYZED || '10000', 10);
 
 const REQUIRE_FRONTEND_TESTS =
